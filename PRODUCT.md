@@ -6,7 +6,7 @@ product
 
 ## Platform
 
-web
+native-windows
 
 ## Users
 

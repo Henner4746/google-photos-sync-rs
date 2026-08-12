@@ -2,69 +2,56 @@
 
 # Google Photos Sync for Windows
 
-**A tiny native Rust tray app that backs up any folders of photos and videos without uploading the same media twice.**
+**A tiny native Rust app that backs up photo and video folders without uploading the same content twice.**
 
-![Windows](https://img.shields.io/badge/Windows-11-111111?style=flat-square&logo=windows11&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-111111?style=flat-square&logo=windows11&logoColor=white)
 ![Rust](https://img.shields.io/badge/Rust-1.91+-111111?style=flat-square&logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-111111?style=flat-square)
+
+[Download](https://github.com/Henner4746/google-photos-sync-rs/releases/latest) · [Homepage](https://henner4746.github.io/google-photos-sync-rs/) · [Privacy](https://henner4746.github.io/google-photos-sync-rs/privacy.html)
 
 </div>
 
 ![Google Photos Sync flyout](docs/screenshot.svg)
 
-Google Photos Sync stays quietly in the Windows notification area. Open the movable monochrome Material-inspired window when you want to manage folders, check the status, run a safe preview, or pause automatic backups. The application is a single native executable: no browser shell, JavaScript runtime, Electron bundle, or background service.
+Google Photos Sync stays quietly in the Windows notification area. Its monochrome Material-style interface manages real folders, schedules, exclusions, Takeout import, backups, and updates. It is a single native executable: no Electron bundle, browser runtime, or background service.
 
-## Why it exists
+## What it does
 
-Google Photos does not provide a desktop folder uploader with content-aware duplicate protection. This app fills that gap for any local folders, including camera imports, artwork, screenshots, and game recordings.
-
-- **Folder management in the app.** Add folders, rename their target albums, open them, or pause each source independently.
-- **Content-based deduplication.** SHA-256 identifies media independently of its path, filename, source folder, or target album.
-- **Read-only previews.** Test runs show what is pending without uploading media or creating Google Photos albums.
-- **No-network fast path.** If size, timestamp, and trusted local state still match, an unchanged run does not call Google at all.
-- **Remote reconciliation.** Media visible to the app through the Google Photos API is indexed before new uploads begin.
-- **Takeout import.** Hashes from an exported Google Photos library can protect older items that the API no longer exposes to a new app.
-- **Safe credentials.** OAuth credentials are encrypted with Windows DPAPI and can only be decrypted by the Windows account that stored them.
-- **Low overhead.** Native Win32 UI, SQLite, four parallel upload streams, and serialized `batchCreate` calls of up to 50 items.
-- **Keyboard-friendly controls.** The window supports Tab navigation, Enter/Space activation, Escape-to-hide, and tested WCAG AA text contrast.
-- **Safe removal semantics.** Removing a source forgets only the folder configuration; it never deletes local files or Google Photos media.
+- **First-run assistant.** Google sign-in, folder selection, the Google Photos limitation, optional Takeout import, and autostart are handled in the UI.
+- **Content-based duplicate protection.** SHA-256 identifies media independently of filename, path, source, or album. A known image or AMD clip is not uploaded again.
+- **Google-side recovery.** Content-addressed filenames reconcile media that this same app can see in Google Photos.
+- **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose.
+- **Per-folder controls.** Each folder has its own album, media type, enabled state, schedule, and excluded subfolders.
+- **Visible work.** Uploads show file progress and transfer speed; errors produce a Windows notification.
+- **Network recovery.** Upload and API calls retry transient failures with backoff. Anything not confirmed remains pending and resumes on the next run.
+- **Persistent state.** Paused state, schedules, window position, and last successful runs survive restarts.
+- **Local backup and restore.** Settings, the duplicate database, and DPAPI-protected credentials can be backed up from the app.
+- **Verified updates.** The updater accepts only GitHub release assets whose SHA-256 digest matches the release metadata.
+- **Low overhead.** Native Win32 UI, SQLite, four upload streams, and small optimized Rust release builds.
 
 ## Install
 
-Download `gphotos-sync.exe` from the latest release or build it locally. In Google Cloud, enable the Google Photos Library API, configure the OAuth consent screen, and download a **Desktop app** OAuth client JSON. Connect it through the browser and install the app:
+Download `Google-Photos-Sync-Setup.exe` from the [latest release](https://github.com/Henner4746/google-photos-sync-rs/releases/latest), run it, and follow the first-run assistant. The installer is per-user, adds a clean Windows autostart entry when selected, and provides a normal uninstaller.
 
-```powershell
-.\gphotos-sync.exe authorize .\client_secret.json
-.\gphotos-sync.exe install
-Remove-Item .\client_secret.json
-```
+Official releases are signing-ready. A trusted Windows signature is present only when the release workflow has access to the project's code-signing certificate; otherwise Windows may show a SmartScreen warning.
 
-The browser flow requests only `photoslibrary.appendonly` and `photoslibrary.readonly.appcreateddata`. The resulting refresh token is encrypted locally with DPAPI. `protect-credentials` also exists for migration from another OAuth tool, but normal installations should use `authorize`.
+For development builds without an embedded production OAuth client, the assistant opens a file picker for a Google **Desktop app** OAuth JSON. Public releases embed that JSON at build time through a protected repository secret; it is never committed.
 
-The first run creates `%LOCALAPPDATA%\GooglePhotosSync\gphotos-sync.json`. Folders can be managed directly in the app; the JSON remains available for portable or scripted setups:
+The app detects standard folders only when they exist in the current Windows profile:
 
-```json
-{
-  "sources": [
-    {
-      "album": "Screenshots",
-      "path": "C:\\Users\\you\\Pictures\\Screenshots",
-      "kind": "images",
-      "enabled": true
-    },
-    {
-      "album": "AMD-Clips",
-      "path": "C:\\Users\\you\\Videos\\Radeon ReLive",
-      "kind": "videos",
-      "enabled": true
-    }
-  ]
-}
-```
+- `Pictures\Screenshots` as **Screenshots**
+- `Videos\Radeon ReLive` as **AMD-Clips**
 
-`kind` accepts `images`, `videos`, or `all`. Window position and source changes are persisted automatically. Existing version 1.0 configurations are migrated on first save.
+No personal drive or user path is stored in the repository. Existing installations keep their own configured folders during upgrades.
 
-`install` copies the current executable into the app data directory and creates a limited-privilege logon task. `uninstall` removes only that task; the database and credentials are preserved intentionally.
+## Google Photos limitation since March 2025
+
+The Google Photos Library API lets an app upload new media but only list content created by that same app. It cannot inspect an existing personal library globally. Therefore:
+
+1. Existing media uploaded by an older version using the same OAuth client can be reconciled through the API.
+2. Existing media outside that app-visible set requires a one-time Google Takeout import for strong duplicate protection.
+3. The Takeout import hashes files locally and uploads nothing.
 
 ## Duplicate model
 
@@ -73,16 +60,25 @@ flowchart LR
     A["Scan configured folders"] --> B{"Size and timestamp unchanged?"}
     B -- Yes --> C["Trust local index\nNo network request"]
     B -- No --> D["Calculate SHA-256"]
-    D --> E{"Hash known in any source or album?"}
+    D --> E{"Hash known locally or via Takeout?"}
     E -- Yes --> F["Record alias\nSkip upload"]
-    E -- No --> G{"Content-addressed name in album?"}
+    E -- No --> G{"App-visible item matches?"}
     G -- Yes --> H["Recover remote record\nSkip upload"]
     G -- No --> I["Upload once"]
+    I --> J{"Google confirms item?"}
+    J -- Yes --> K["Persist protected state"]
+    J -- No --> L["Keep pending\nRetry later"]
 ```
 
-The local database is the primary index. Upload names include the first 12 characters of the content hash, making remote recovery deterministic. A Takeout import adds hashes only and never uploads anything.
+## Data and privacy
 
-## Commands
+Configuration, SQLite index, logs, and protected credentials live under `%LOCALAPPDATA%\GooglePhotosSync` for new installations. OAuth refresh tokens are encrypted with Windows DPAPI for the current Windows account. Backups containing the credential file remain bound to that account and PC context.
+
+The app has no own backend, analytics, advertising, or telemetry. See the full [privacy statement](https://henner4746.github.io/google-photos-sync-rs/privacy.html).
+
+## Advanced commands
+
+The normal user flow requires no console. These commands remain for diagnostics and automation:
 
 ```text
 gphotos-sync sync [--dry-run] [--limit <items-per-album>]
@@ -90,7 +86,6 @@ gphotos-sync tray [--show] [--no-sync]
 gphotos-sync status
 gphotos-sync import-takeout <unpacked-takeout-folder>
 gphotos-sync authorize <oauth-client.json>
-gphotos-sync protect-credentials <credentials.json>
 gphotos-sync install
 gphotos-sync uninstall
 ```
@@ -106,14 +101,7 @@ cargo test
 cargo build --release
 ```
 
-The optimized executable is written to `target\release\gphotos-sync.exe`.
-
-## Privacy and API limitations
-
-- No credentials, cookies, database files, media, or logs belong in the repository.
-- DPAPI protects credentials at rest; it does not hide them from a process running as the same Windows user.
-- The Google Photos Library API generally exposes media created by the same API client. For a pre-existing library, import a Google Takeout folder once before the first live sync for the strongest duplicate protection.
-- Deleting a local file does not delete its Google Photos copy.
+To embed the public Desktop OAuth configuration for a release build, set `GPHOTOS_SYNC_OAUTH_CLIENT_JSON` only in the protected build environment. See [the OAuth release checklist](docs/OAUTH_RELEASE_CHECKLIST.md).
 
 ## License
 

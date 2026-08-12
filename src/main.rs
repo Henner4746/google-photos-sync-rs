@@ -20,8 +20,8 @@ use std::net::TcpListener;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -36,8 +36,9 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const GOOGLE_API: &str = "https://photoslibrary.googleapis.com/v1";
 const GOOGLE_UPLOADS: &str = "https://photoslibrary.googleapis.com/v1/uploads";
 const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
-const TASK_NAME: &str = "Google-Photos-Sync";
-const LEGACY_TASK_NAMES: &[&str] = &["Henrik-Google-Photos-Sync"];
+const AUTOSTART_NAME: &str = "Google Photos Sync";
+const DEFAULT_SCHEDULE_MINUTES: u32 = 15;
+const MIN_SCHEDULE_MINUTES: u32 = 5;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tif", "tiff", "bmp",
@@ -55,6 +56,12 @@ struct SourceSpec {
     kind: MediaKind,
     #[serde(default = "default_true")]
     enabled: bool,
+    #[serde(default = "default_schedule_minutes")]
+    schedule_minutes: u32,
+    #[serde(default)]
+    excluded_subfolders: Vec<PathBuf>,
+    #[serde(default)]
+    last_successful_sync: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +86,10 @@ const fn default_true() -> bool {
     true
 }
 
+const fn default_schedule_minutes() -> u32 {
+    DEFAULT_SCHEDULE_MINUTES
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct AppConfig {
     sources: Vec<SourceSpec>,
@@ -86,6 +97,16 @@ struct AppConfig {
     window_x: Option<i32>,
     #[serde(default)]
     window_y: Option<i32>,
+    #[serde(default)]
+    paused: bool,
+    #[serde(default)]
+    onboarding_completed: bool,
+    #[serde(default = "default_true")]
+    autostart_enabled: bool,
+    #[serde(default = "default_true")]
+    auto_update: bool,
+    #[serde(default)]
+    takeout_imported_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -140,6 +161,56 @@ struct SyncStats {
 struct SyncRunOptions {
     dry_run: bool,
     limit: Option<usize>,
+}
+
+#[derive(Default)]
+struct OperationProgress {
+    files_total: AtomicUsize,
+    files_done: AtomicUsize,
+    bytes_total: AtomicU64,
+    bytes_done: AtomicU64,
+    started_at: AtomicI64,
+}
+
+impl OperationProgress {
+    fn begin(&self) {
+        self.files_total.store(0, Ordering::Release);
+        self.files_done.store(0, Ordering::Release);
+        self.bytes_total.store(0, Ordering::Release);
+        self.bytes_done.store(0, Ordering::Release);
+        self.started_at.store(unix_seconds(), Ordering::Release);
+    }
+
+    fn add_plan(&self, files: usize, bytes: u64) {
+        self.files_total.fetch_add(files, Ordering::AcqRel);
+        self.bytes_total.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    fn finish_file(&self, bytes: u64) {
+        self.files_done.fetch_add(1, Ordering::AcqRel);
+        self.bytes_done.fetch_add(bytes, Ordering::AcqRel);
+    }
+
+    fn add_uploaded_bytes(&self, bytes: usize) {
+        self.bytes_done.fetch_add(bytes as u64, Ordering::AcqRel);
+    }
+
+    fn finish_streamed_file(&self) {
+        self.files_done.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct ProgressReader {
+    inner: File,
+    progress: Arc<OperationProgress>,
+}
+
+impl Read for ProgressReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.progress.add_uploaded_bytes(read);
+        Ok(read)
+    }
 }
 
 struct Logger {
@@ -253,20 +324,20 @@ fn real_main() -> AppResult<()> {
     let paths = AppPaths::discover()?;
     let logger = Logger::open(&paths.log)?;
     let args: Vec<String> = env::args().skip(1).collect();
-    let command = args.first().map(String::as_str).unwrap_or("sync");
+    let command = args.first().map(String::as_str).unwrap_or("tray");
 
     match command {
         "sync" => {
             let dry_run = args.iter().any(|arg| arg == "--dry-run");
             let limit = option_usize(&args, "--limit")?;
             let _instance = SingleInstance::acquire()?;
-            sync(&paths, &logger, dry_run, limit)
+            sync(&paths, &logger, dry_run, limit, None)
         }
         "import-takeout" => {
             let input = args
                 .get(1)
                 .ok_or("Aufruf: gphotos-sync import-takeout <Ordner>")?;
-            import_takeout(&paths, &logger, Path::new(input))
+            import_takeout(&paths, &logger, Path::new(input), None)
         }
         "protect-credentials" => {
             let input = args
@@ -282,6 +353,21 @@ fn real_main() -> AppResult<()> {
         }
         "install" => install(&paths),
         "uninstall" => uninstall(),
+        "apply-update" => {
+            let target = args.get(1).ok_or("Ziel der Aktualisierung fehlt.")?;
+            let pid = args
+                .get(2)
+                .ok_or("Prozess-ID der Aktualisierung fehlt.")?
+                .parse()?;
+            apply_downloaded_update(Path::new(target), pid)
+        }
+        "restart-after" => {
+            let pid = args
+                .get(1)
+                .ok_or("Prozess-ID für Neustart fehlt.")?
+                .parse()?;
+            restart_after(pid)
+        }
         "status" => show_status(&paths),
         "tray" => tray::run(
             paths,
@@ -313,12 +399,18 @@ fn print_help() {
 
 #[derive(Clone)]
 struct AppPaths {
+    root: PathBuf,
     credentials: PathBuf,
     database: PathBuf,
     log: PathBuf,
     config: PathBuf,
     sources: Vec<SourceSpec>,
     window_position: Option<(i32, i32)>,
+    paused: bool,
+    onboarding_completed: bool,
+    autostart_enabled: bool,
+    auto_update: bool,
+    takeout_imported_at: Option<i64>,
 }
 
 impl AppPaths {
@@ -344,12 +436,18 @@ impl AppPaths {
         let loaded = load_or_create_config(&config)?;
         let window_position = loaded.window_x.zip(loaded.window_y);
         Ok(Self {
+            root: root.clone(),
             credentials: root.join("gphotos-rust.credentials"),
             database: root.join("gphotos-rust.db"),
             log: root.join("logs").join("gphotos").join("gphotos-rust.log"),
             config,
             sources: loaded.sources,
             window_position,
+            paused: loaded.paused,
+            onboarding_completed: loaded.onboarding_completed,
+            autostart_enabled: loaded.autostart_enabled,
+            auto_update: loaded.auto_update,
+            takeout_imported_at: loaded.takeout_imported_at,
         })
     }
 }
@@ -365,59 +463,64 @@ fn install(paths: &AppPaths) -> AppResult<()> {
     if source.canonicalize()? != destination.canonicalize().unwrap_or_default() {
         fs::copy(&source, &destination)?;
     }
-    let action = format!("\"{}\" tray", destination.display());
-    let status = Command::new("schtasks.exe")
-        .args([
-            "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/RL", "LIMITED", "/TR",
-        ])
-        .arg(action)
-        .arg("/F")
-        .status()?;
-    let autostart_name = if status.success() {
-        for legacy_name in LEGACY_TASK_NAMES {
-            remove_task_if_present(legacy_name)?;
-        }
-        TASK_NAME
-    } else if let Some(existing) = LEGACY_TASK_NAMES
-        .iter()
-        .find(|name| task_exists(name).unwrap_or(false))
-    {
-        existing
-    } else {
-        return Err("Autostart-Aufgabe konnte nicht erstellt werden.".into());
-    };
+    set_autostart_executable(&destination, true)?;
     println!("Installiert: {}", destination.display());
-    println!("Autostart: {autostart_name}");
+    println!("Autostart: {AUTOSTART_NAME}");
     Ok(())
 }
 
 fn uninstall() -> AppResult<()> {
-    remove_task_if_present(TASK_NAME)?;
-    for legacy_name in LEGACY_TASK_NAMES {
-        remove_task_if_present(legacy_name)?;
-    }
+    set_autostart_executable(Path::new(""), false)?;
     println!("Autostart wurde entfernt. Lokale Daten bleiben erhalten.");
     Ok(())
 }
 
-fn remove_task_if_present(task_name: &str) -> AppResult<bool> {
-    if !task_exists(task_name)? {
-        return Ok(false);
-    }
-    let deleted = Command::new("schtasks.exe")
-        .args(["/Delete", "/TN", task_name, "/F"])
-        .status()?;
-    if !deleted.success() {
-        return Err(format!("Autostart-Aufgabe {task_name} konnte nicht entfernt werden.").into());
-    }
-    Ok(true)
-}
+fn set_autostart_executable(executable: &Path, enabled: bool) -> AppResult<()> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
+        RegCreateKeyExW, RegDeleteValueW, RegSetValueExW,
+    };
 
-fn task_exists(task_name: &str) -> AppResult<bool> {
-    Ok(Command::new("schtasks.exe")
-        .args(["/Query", "/TN", task_name])
-        .status()?
-        .success())
+    let key_path = wide_main(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let value_name = wide_main(AUTOSTART_NAME);
+    let mut key: HKEY = std::ptr::null_mut();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key_path.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32).into());
+    }
+    let result = if enabled {
+        let value = wide_main(&format!("\"{}\" tray", executable.display()));
+        unsafe {
+            RegSetValueExW(
+                key,
+                value_name.as_ptr(),
+                0,
+                REG_SZ,
+                value.as_ptr().cast(),
+                u32::try_from(value.len() * std::mem::size_of::<u16>())?,
+            )
+        }
+    } else {
+        let status = unsafe { RegDeleteValueW(key, value_name.as_ptr()) };
+        if status == 2 { 0 } else { status }
+    };
+    unsafe { RegCloseKey(key) };
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result as i32).into());
+    }
+    Ok(())
 }
 
 fn write_example_config(path: &Path) -> AppResult<()> {
@@ -432,6 +535,9 @@ fn write_example_config(path: &Path) -> AppResult<()> {
             path: screenshots,
             kind: MediaKind::Images,
             enabled: true,
+            schedule_minutes: DEFAULT_SCHEDULE_MINUTES,
+            excluded_subfolders: Vec::new(),
+            last_successful_sync: 0,
         });
     }
     let amd_clips = profile.join("Videos").join("Radeon ReLive");
@@ -441,12 +547,20 @@ fn write_example_config(path: &Path) -> AppResult<()> {
             path: amd_clips,
             kind: MediaKind::Videos,
             enabled: true,
+            schedule_minutes: DEFAULT_SCHEDULE_MINUTES,
+            excluded_subfolders: Vec::new(),
+            last_successful_sync: 0,
         });
     }
     let config = AppConfig {
         sources,
         window_x: None,
         window_y: None,
+        paused: false,
+        onboarding_completed: false,
+        autostart_enabled: true,
+        auto_update: true,
+        takeout_imported_at: None,
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -455,10 +569,16 @@ fn write_example_config(path: &Path) -> AppResult<()> {
     Ok(())
 }
 
-fn save_sources(
+#[allow(clippy::too_many_arguments)]
+fn save_config(
     path: &Path,
     sources: &[SourceSpec],
     window_position: Option<(i32, i32)>,
+    paused: bool,
+    onboarding_completed: bool,
+    autostart_enabled: bool,
+    auto_update: bool,
+    takeout_imported_at: Option<i64>,
 ) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -467,6 +587,11 @@ fn save_sources(
         sources: sources.to_vec(),
         window_x: window_position.map(|position| position.0),
         window_y: window_position.map(|position| position.1),
+        paused,
+        onboarding_completed,
+        autostart_enabled,
+        auto_update,
+        takeout_imported_at,
     };
     fs::write(path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
@@ -474,7 +599,11 @@ fn save_sources(
 
 fn load_or_create_config(path: &Path) -> AppResult<AppConfig> {
     if path.is_file() {
-        return Ok(serde_json::from_slice(&fs::read(path)?)?);
+        let mut config: AppConfig = serde_json::from_slice(&fs::read(path)?)?;
+        for source in &mut config.sources {
+            source.schedule_minutes = source.schedule_minutes.max(MIN_SCHEDULE_MINUTES);
+        }
+        return Ok(config);
     }
     write_example_config(path)?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
@@ -519,7 +648,17 @@ fn default_token_uri() -> String {
 }
 
 fn authorize(paths: &AppPaths, input: &Path) -> AppResult<()> {
-    let client_file: OAuthClientFile = serde_json::from_slice(&fs::read(input)?)?;
+    authorize_json(paths, &fs::read(input)?)
+}
+
+fn embedded_oauth_client() -> Option<&'static [u8]> {
+    option_env!("GPHOTOS_SYNC_OAUTH_CLIENT_JSON")
+        .filter(|value| !value.trim().is_empty())
+        .map(str::as_bytes)
+}
+
+fn authorize_json(paths: &AppPaths, input: &[u8]) -> AppResult<()> {
+    let client_file: OAuthClientFile = serde_json::from_slice(input)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
@@ -605,6 +744,52 @@ fn authorize(paths: &AppPaths, input: &Path) -> AppResult<()> {
     }
     fs::write(&paths.credentials, hex_encode(&protected))?;
     println!("Google Photos wurde verbunden. Die OAuth-Datei kann gel\u{00f6}scht werden.");
+    Ok(())
+}
+
+fn apply_downloaded_update(target: &Path, previous_pid: u32) -> AppResult<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+
+    unsafe {
+        let process = OpenProcess(0x0010_0000, 0, previous_pid);
+        if !process.is_null() {
+            let _ = WaitForSingleObject(process, 30_000);
+            CloseHandle(process);
+        }
+    }
+    let source = env::current_exe()?;
+    let mut last_error = None;
+    for _ in 0..20 {
+        match fs::copy(&source, target) {
+            Ok(_) => {
+                Command::new(target).arg("tray").spawn()?;
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = Some(error);
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::other("Aktualisierung fehlgeschlagen."))
+        .into())
+}
+
+fn restart_after(previous_pid: u32) -> AppResult<()> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
+    unsafe {
+        let process = OpenProcess(0x0010_0000, 0, previous_pid);
+        if !process.is_null() {
+            let _ = WaitForSingleObject(process, 30_000);
+            CloseHandle(process);
+        }
+    }
+    Command::new(env::current_exe()?)
+        .args(["tray", "--show"])
+        .spawn()?;
     Ok(())
 }
 
@@ -838,7 +1023,14 @@ impl GoogleClient {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            let response = request.send()?;
+            let response = match request.send() {
+                Ok(response) => response,
+                Err(_error) if attempt < 5 => {
+                    wait_network_retry(attempt);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if response.status().as_u16() == 401 && !refreshed {
                 self.refresh_access_token()?;
                 refreshed = true;
@@ -946,10 +1138,27 @@ impl GoogleClient {
         Ok(result)
     }
 
-    fn raw_upload(&self, path: &Path, mime: &str, size: u64) -> AppResult<String> {
+    fn raw_upload(
+        &self,
+        path: &Path,
+        mime: &str,
+        size: u64,
+        progress: Option<Arc<OperationProgress>>,
+    ) -> AppResult<String> {
         for attempt in 0..6 {
             let file = File::open(path)?;
-            let response = self
+            let body = if let Some(progress) = progress.clone() {
+                reqwest::blocking::Body::sized(
+                    ProgressReader {
+                        inner: file,
+                        progress,
+                    },
+                    size,
+                )
+            } else {
+                reqwest::blocking::Body::sized(file, size)
+            };
+            let response = match self
                 .http
                 .post(GOOGLE_UPLOADS)
                 .bearer_auth(&self.access_token)
@@ -957,8 +1166,16 @@ impl GoogleClient {
                 .header("X-Goog-Upload-Content-Type", mime)
                 .header("X-Goog-Upload-Protocol", "raw")
                 .header("Content-Length", size)
-                .body(file)
-                .send()?;
+                .body(body)
+                .send()
+            {
+                Ok(response) => response,
+                Err(_error) if attempt < 5 => {
+                    wait_network_retry(attempt);
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             if response.status().as_u16() == 401 {
                 return Err("Der Google-Zugang ist waehrend des Uploads abgelaufen.".into());
             }
@@ -1025,6 +1242,10 @@ fn wait_before_retry(response: &Response, attempt: usize) {
     thread::sleep(Duration::from_secs(seconds));
 }
 
+fn wait_network_retry(attempt: usize) {
+    thread::sleep(Duration::from_secs(2_u64.pow((attempt as u32).min(5))));
+}
+
 fn safe_google_error(value: &Value) -> String {
     value
         .pointer("/error/message")
@@ -1039,7 +1260,11 @@ fn sync(
     logger: &Logger,
     dry_run: bool,
     limit_per_source: Option<usize>,
+    progress: Option<Arc<OperationProgress>>,
 ) -> AppResult<()> {
+    if let Some(progress) = &progress {
+        progress.begin();
+    }
     logger.log(
         "START",
         if dry_run {
@@ -1113,6 +1338,7 @@ fn sync(
             &album_id,
             &remote,
             options,
+            progress.as_ref(),
         )?;
         logger.log(
             "ERGEBNIS",
@@ -1154,6 +1380,7 @@ fn sync(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sync_source(
     database: &mut Connection,
     google: &mut GoogleClient,
@@ -1162,9 +1389,10 @@ fn sync_source(
     album_id: &str,
     remote: &HashMap<String, String>,
     options: SyncRunOptions,
+    progress: Option<&Arc<OperationProgress>>,
 ) -> AppResult<SyncStats> {
     let mut stats = SyncStats::default();
-    let files = source_files(&source.path, source.extensions())?;
+    let files = source_files_for_source(source)?;
     stats.scanned = files.len();
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut candidate_by_hash: HashMap<String, usize> = HashMap::new();
@@ -1260,6 +1488,15 @@ fn sync_source(
         candidates.truncate(limit);
     }
     stats.planned = candidates.len();
+    if let Some(progress) = progress {
+        progress.add_plan(
+            candidates.len(),
+            candidates
+                .iter()
+                .map(|candidate| candidate.primary.size.max(0) as u64)
+                .sum(),
+        );
+    }
     if options.dry_run {
         for candidate in &candidates {
             logger.log(
@@ -1299,6 +1536,7 @@ fn sync_source(
                                 &candidate.primary.path,
                                 mime_type(&candidate.primary.path),
                                 candidate.primary.size as u64,
+                                progress.cloned(),
                             )
                             .map_err(|error| error.to_string());
                         upload_results
@@ -1312,6 +1550,9 @@ fn sync_source(
         let mut upload_results = upload_results.into_inner().expect("upload result lock");
         upload_results.sort_by_key(|(index, _)| *index);
         for (index, result) in upload_results {
+            if let Some(progress) = progress {
+                progress.finish_streamed_file();
+            }
             match result {
                 Ok(token) => {
                     token_to_index.insert(token.clone(), index);
@@ -1460,7 +1701,7 @@ fn fully_known_source(
     connection: &Connection,
     source: &SourceSpec,
 ) -> AppResult<Option<SyncStats>> {
-    let files = source_files(&source.path, source.extensions())?;
+    let files = source_files_for_source(source)?;
     for path in &files {
         let metadata = fs::metadata(path)?;
         let size = i64::try_from(metadata.len())?;
@@ -1577,7 +1818,12 @@ fn upsert_record_on(
     Ok(())
 }
 
-fn import_takeout(paths: &AppPaths, logger: &Logger, root: &Path) -> AppResult<()> {
+fn import_takeout(
+    paths: &AppPaths,
+    logger: &Logger,
+    root: &Path,
+    progress: Option<Arc<OperationProgress>>,
+) -> AppResult<()> {
     if !root.is_dir() {
         return Err(format!("Takeout-Ordner nicht gefunden: {}", root.display()).into());
     }
@@ -1588,17 +1834,34 @@ fn import_takeout(paths: &AppPaths, logger: &Logger, root: &Path) -> AppResult<(
         .copied()
         .collect();
     let files = source_files(root, &extensions.iter().copied().collect::<Vec<_>>())?;
+    if let Some(progress) = &progress {
+        progress.begin();
+        progress.add_plan(
+            files.len(),
+            files
+                .iter()
+                .filter_map(|path| fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .sum(),
+        );
+    }
     logger.log(
         "START",
         format!("Importiere Hashes aus {} Mediendateien", files.len()),
     );
     let mut inserted = 0;
     for (index, path) in files.iter().enumerate() {
+        let size = fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         let hash = sha256_file(path)?;
         inserted += connection.execute(
             "INSERT OR IGNORE INTO known_hashes(sha256, source, imported_at) VALUES(?1, ?2, ?3)",
             params![hash, root.to_string_lossy(), unix_seconds()],
         )?;
+        if let Some(progress) = &progress {
+            progress.finish_file(size);
+        }
         if (index + 1) % 250 == 0 {
             logger.log(
                 "INFO",
@@ -1619,7 +1882,7 @@ fn import_takeout(paths: &AppPaths, logger: &Logger, root: &Path) -> AppResult<(
 fn show_status(paths: &AppPaths) -> AppResult<()> {
     let connection = open_database(&paths.database)?;
     println!("Rust Google-Fotos-Sync");
-    println!("Aufgabe: {TASK_NAME}");
+    println!("Autostart: {AUTOSTART_NAME}");
     println!("Datenbank: {}", paths.database.display());
     println!("Protokoll: {}", paths.log.display());
     println!(
@@ -1646,9 +1909,51 @@ fn show_status(paths: &AppPaths) -> AppResult<()> {
 }
 
 fn source_files(root: &Path, extensions: &[&str]) -> AppResult<Vec<PathBuf>> {
+    source_files_excluding(root, extensions, &[])
+}
+
+fn source_files_for_source(source: &SourceSpec) -> AppResult<Vec<PathBuf>> {
+    source_files_excluding(
+        &source.path,
+        source.extensions(),
+        &source.excluded_subfolders,
+    )
+}
+
+fn source_files_excluding(
+    root: &Path,
+    extensions: &[&str],
+    excluded_subfolders: &[PathBuf],
+) -> AppResult<Vec<PathBuf>> {
     let allowed: HashSet<&str> = extensions.iter().copied().collect();
+    let excluded: Vec<String> = excluded_subfolders
+        .iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                root.join(path)
+            };
+            normalized_fs_path(&absolute)
+        })
+        .collect();
     let mut files = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false) {
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let candidate = normalized_fs_path(entry.path());
+            !excluded.iter().any(|excluded| {
+                candidate == *excluded
+                    || candidate
+                        .strip_prefix(excluded)
+                        .is_some_and(|rest| rest.starts_with('\\'))
+            })
+        });
+    for entry in walker {
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
@@ -1665,6 +1970,22 @@ fn source_files(root: &Path, extensions: &[&str]) -> AppResult<Vec<PathBuf>> {
     }
     files.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
     Ok(files)
+}
+
+fn normalized_fs_path(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn wide_main(value: &str) -> Vec<u16> {
+    OsStr::new(value)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 fn sha256_file(path: &Path) -> AppResult<String> {
@@ -1810,9 +2131,17 @@ mod tests {
                 path: PathBuf::from(r"D:\Captures"),
                 kind: MediaKind::Videos,
                 enabled: true,
+                schedule_minutes: 30,
+                excluded_subfolders: vec![PathBuf::from(r"D:\Captures\Temp")],
+                last_successful_sync: 123,
             }],
             window_x: Some(100),
             window_y: Some(200),
+            paused: true,
+            onboarding_completed: true,
+            autostart_enabled: true,
+            auto_update: true,
+            takeout_imported_at: Some(99),
         };
         let encoded = serde_json::to_vec(&config).unwrap();
         let decoded: AppConfig = serde_json::from_slice(&encoded).unwrap();
@@ -1820,7 +2149,12 @@ mod tests {
         assert_eq!(decoded.sources[0].path, PathBuf::from(r"D:\Captures"));
         assert!(matches!(decoded.sources[0].kind, MediaKind::Videos));
         assert!(decoded.sources[0].enabled);
+        assert_eq!(decoded.sources[0].schedule_minutes, 30);
+        assert_eq!(decoded.sources[0].excluded_subfolders.len(), 1);
+        assert_eq!(decoded.sources[0].last_successful_sync, 123);
         assert_eq!((decoded.window_x, decoded.window_y), (Some(100), Some(200)));
+        assert!(decoded.paused);
+        assert!(decoded.onboarding_completed);
     }
 
     #[test]
@@ -1830,7 +2164,17 @@ mod tests {
         )
         .unwrap();
         assert!(decoded.sources[0].enabled);
+        assert_eq!(
+            decoded.sources[0].schedule_minutes,
+            DEFAULT_SCHEDULE_MINUTES
+        );
+        assert!(decoded.sources[0].excluded_subfolders.is_empty());
+        assert_eq!(decoded.sources[0].last_successful_sync, 0);
         assert_eq!((decoded.window_x, decoded.window_y), (None, None));
+        assert!(!decoded.paused);
+        assert!(!decoded.onboarding_completed);
+        assert!(decoded.autostart_enabled);
+        assert!(decoded.auto_update);
     }
 
     #[test]
@@ -1851,5 +2195,31 @@ mod tests {
         let known = record_by_hash(&connection, "same-hash").unwrap().unwrap();
         assert_eq!(known.0, "photo-hash.jpg");
         assert_eq!(known.1, "media-1");
+    }
+
+    #[test]
+    fn excluded_subfolders_are_not_scanned() {
+        let root = env::temp_dir().join(format!("gphotos-exclude-{}", unix_seconds()));
+        let keep = root.join("keep");
+        let exclude = root.join("private");
+        fs::create_dir_all(&keep).unwrap();
+        fs::create_dir_all(&exclude).unwrap();
+        fs::write(keep.join("visible.jpg"), b"visible").unwrap();
+        fs::write(exclude.join("hidden.jpg"), b"hidden").unwrap();
+        let files =
+            source_files_excluding(&root, &["jpg"], std::slice::from_ref(&exclude)).unwrap();
+        assert_eq!(files, vec![keep.join("visible.jpg")]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn progress_counts_streamed_bytes() {
+        let progress = Arc::new(OperationProgress::default());
+        progress.begin();
+        progress.add_plan(1, 3);
+        progress.add_uploaded_bytes(2);
+        progress.finish_streamed_file();
+        assert_eq!(progress.files_done.load(Ordering::Acquire), 1);
+        assert_eq!(progress.bytes_done.load(Ordering::Acquire), 2);
     }
 }

@@ -35,6 +35,12 @@ pub(super) unsafe fn paint(
     has_selection: bool,
     animation: u32,
     next_run: i64,
+    setup: bool,
+    google_connected: bool,
+    has_folder: bool,
+    takeout_imported: bool,
+    autostart: bool,
+    settings: bool,
 ) {
     unsafe {
         let mut paint = PAINTSTRUCT::default();
@@ -42,14 +48,93 @@ pub(super) unsafe fn paint(
         fill(dc, rect(0, 0, 720, 656), SURFACE);
         SetBkMode(dc, TRANSPARENT as i32);
         let fonts = Fonts::create();
-        header(dc, paused, &fonts);
-        status_panel(
-            dc, view, paused, syncing, dry_run, animation, next_run, &fonts,
-        );
-        metrics(dc, view, &fonts);
-        sources_panel(dc, view, has_selection, &fonts);
+        if settings {
+            settings_page(dc, view, autostart, &fonts);
+        } else if setup {
+            setup_page(
+                dc,
+                view,
+                google_connected,
+                has_folder,
+                takeout_imported,
+                autostart,
+                &fonts,
+            );
+        } else {
+            header(dc, paused, &fonts);
+            status_panel(
+                dc, view, paused, syncing, dry_run, animation, next_run, &fonts,
+            );
+            metrics(dc, view, &fonts);
+            sources_panel(dc, view, has_selection, &fonts);
+        }
         fonts.destroy();
         EndPaint(hwnd, &paint);
+    }
+}
+
+unsafe fn settings_page(dc: HDC, view: &ViewState, autostart: bool, fonts: &Fonts) {
+    unsafe {
+        text(
+            dc,
+            "Einstellungen",
+            rect(40, 30, 600, 72),
+            TEXT_PRIMARY,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.title,
+        );
+        text(
+            dc,
+            "Leichtgewichtig, lokal und pro Ordner steuerbar",
+            rect(40, 72, 680, 100),
+            TEXT_SECONDARY,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.body,
+        );
+        text(
+            dc,
+            "Ausgewählter Ordner",
+            rect(40, 128, 680, 156),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            "Lokale App-Daten",
+            rect(40, 294, 680, 322),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            "Datensicherung enthält Einstellungen, Duplikat-Datenbank und den Windows-geschützten Google-Zugang.",
+            rect(40, 382, 680, 414),
+            TEXT_SECONDARY,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            if autostart {
+                "Autostart ist aktiv"
+            } else {
+                "Autostart ist aus"
+            },
+            rect(40, 414, 680, 438),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            &view.detail,
+            rect(40, 590, 680, 628),
+            TEXT_MUTED,
+            DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
     }
 }
 
@@ -81,7 +166,7 @@ pub(super) unsafe fn paint_button(
                 SURFACE
             },
         );
-        let primary = command == CMD_SYNC;
+        let primary = matches!(command, CMD_SYNC | super::CMD_SETUP_FINISH);
         let bare = command == CMD_CLOSE;
         let base = if primary { PRIMARY } else { SURFACE_HIGH };
         let button_color = if disabled {
@@ -125,6 +210,94 @@ pub(super) unsafe fn paint_button(
         );
         DeleteObject(label_font);
         EndPaint(hwnd, &paint);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn setup_page(
+    dc: HDC,
+    view: &ViewState,
+    google_connected: bool,
+    has_folder: bool,
+    takeout_imported: bool,
+    autostart: bool,
+    fonts: &Fonts,
+) {
+    unsafe {
+        text(
+            dc,
+            "Google Photos Sync einrichten",
+            rect(40, 30, 680, 72),
+            TEXT_PRIMARY,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.title,
+        );
+        text(
+            dc,
+            "Alles Wichtige direkt in der App · keine Konsole",
+            rect(40, 72, 680, 100),
+            TEXT_SECONDARY,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.body,
+        );
+        rounded_fill(dc, rect(40, 116, 680, 218), 16, SURFACE_CONTAINER);
+        text(
+            dc,
+            "Wichtig zu vorhandenen Google-Fotos",
+            rect(60, 132, 660, 160),
+            TEXT_PRIMARY,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.heading,
+        );
+        text(
+            dc,
+            "Seit März 2025 sieht die Google-API nur Medien, die diese App selbst hochgeladen hat.",
+            rect(60, 162, 660, 186),
+            TEXT_SECONDARY,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.body,
+        );
+        text(
+            dc,
+            "Ein Takeout-Import verhindert Duplikate mit bereits vorhandenen Bildern und Videos.",
+            rect(60, 186, 660, 208),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        for (top, done) in [
+            (242, google_connected),
+            (306, has_folder),
+            (370, takeout_imported),
+            (434, autostart),
+        ] {
+            rounded_fill(
+                dc,
+                rect(58, top + 19, 68, top + 29),
+                5,
+                if done { TEXT_PRIMARY } else { TEXT_MUTED },
+            );
+        }
+        text(
+            dc,
+            if view.status == "Bereit" {
+                ""
+            } else {
+                &view.detail
+            },
+            rect(40, 486, 680, 516),
+            TEXT_SECONDARY,
+            DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            "Die ausgewählten Ordner bleiben auf diesem PC. Hochgeladen werden nur neue Inhalte.",
+            rect(40, 590, 680, 628),
+            TEXT_MUTED,
+            DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
     }
 }
 
@@ -188,8 +361,9 @@ pub(super) unsafe fn paint_source_item(item: &DRAWITEMSTRUCT, source: Option<&So
         text(
             item.hDC,
             &format!(
-                "{}  ·  {kind}",
-                if source.enabled { "Aktiv" } else { "Pausiert" }
+                "{}  ·  {kind}  ·  {} Min.",
+                if source.enabled { "Aktiv" } else { "Pausiert" },
+                source.schedule_minutes,
             ),
             rect(
                 bounds.right - 142,
@@ -374,7 +548,13 @@ unsafe fn status_panel(
             fonts.label,
         );
         rounded_fill(dc, rect(40, 178, 680, 182), 2, OUTLINE);
-        if syncing {
+        if syncing && view.progress_total > 0 {
+            let ratio = (view.progress_files.min(view.progress_total) as f64
+                / view.progress_total as f64)
+                .clamp(0.0, 1.0);
+            let right = 40 + (640.0 * ratio) as i32;
+            rounded_fill(dc, rect(40, 178, right.max(40), 182), 2, TEXT_PRIMARY);
+        } else if syncing {
             let left = 40 + ((animation as i32 * 19) % 500);
             rounded_fill(dc, rect(left, 178, left + 140, 182), 2, TEXT_PRIMARY);
         } else {

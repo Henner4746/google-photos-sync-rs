@@ -1,9 +1,12 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::{
-    AppPaths, Logger, MediaKind, SingleInstance, SourceSpec, current_record, open_database,
-    save_sources, source_files, sync, trusted_state, unix_seconds,
+    AppPaths, DEFAULT_SCHEDULE_MINUTES, Logger, MediaKind, OperationProgress, SingleInstance,
+    SourceSpec, authorize, authorize_json, current_record, embedded_oauth_client, hex_encode,
+    import_takeout, open_database, save_config, set_autostart_executable, source_files,
+    source_files_for_source, sync, trusted_state, unix_seconds,
 };
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -22,6 +25,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
@@ -29,9 +35,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{
     BIF_EDITBOX, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DefSubclassProc, NIF_ICON,
-    NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
-    RemoveWindowSubclass, SHBrowseForFolderW, SHGetPathFromIDListW, SetWindowSubclass,
-    Shell_NotifyIconGetRect, Shell_NotifyIconW, ShellExecuteW,
+    NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_ERROR, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    NOTIFYICONIDENTIFIER, RemoveWindowSubclass, SHBrowseForFolderW, SHGetPathFromIDListW,
+    SetWindowSubclass, Shell_NotifyIconGetRect, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETSTATE, BN_CLICKED, BS_DEFPUSHBUTTON, BS_NOTIFY, BS_PUSHBUTTON, BST_PUSHED,
@@ -60,6 +66,7 @@ const TRAY_ID: u32 = 1;
 const TIMER_SCHEDULE: usize = 1;
 const TIMER_INITIAL: usize = 2;
 const TIMER_ANIMATION: usize = 3;
+const TIMER_UPDATE: usize = 4;
 const CMD_OPEN: usize = 1001;
 const CMD_SYNC: usize = 1002;
 const CMD_EXIT: usize = 1003;
@@ -75,6 +82,21 @@ const CMD_REMOVE_SOURCE: usize = 1012;
 const CMD_DRY_RUN: usize = 1013;
 const CMD_OPEN_LOG: usize = 1014;
 const CMD_OPEN_PHOTOS: usize = 1015;
+const CMD_SETUP_GOOGLE: usize = 1016;
+const CMD_SETUP_FOLDER: usize = 1017;
+const CMD_SETUP_TAKEOUT: usize = 1018;
+const CMD_SETUP_AUTOSTART: usize = 1019;
+const CMD_SETUP_FINISH: usize = 1020;
+const CMD_SCHEDULE: usize = 1021;
+const CMD_EXCLUDE: usize = 1022;
+const CMD_BACKUP: usize = 1023;
+const CMD_RESTORE: usize = 1024;
+const CMD_SETTINGS: usize = 1025;
+const CMD_UPDATE: usize = 1026;
+const WM_WORK_FINISHED: u32 = WM_APP + 2;
+const WORK_GOOGLE: usize = 1;
+const WORK_TAKEOUT: usize = 2;
+const WORK_UPDATE: usize = 3;
 
 const WINDOW_WIDTH: i32 = 720;
 const WINDOW_HEIGHT: i32 = 656;
@@ -93,6 +115,18 @@ const BUTTON_DRY_RUN: RECT = rect(248, 588, 396, 632);
 const BUTTON_PAUSE: RECT = rect(408, 588, 562, 632);
 const BUTTON_OPEN_LOG: RECT = rect(574, 588, 696, 632);
 
+const SETUP_GOOGLE: RECT = rect(40, 242, 680, 290);
+const SETUP_FOLDER: RECT = rect(40, 306, 680, 354);
+const SETUP_TAKEOUT: RECT = rect(40, 370, 680, 418);
+const SETUP_AUTOSTART: RECT = rect(40, 434, 680, 482);
+const SETUP_FINISH: RECT = rect(40, 526, 680, 578);
+const BUTTON_SETTINGS: RECT = rect(620, 20, 660, 56);
+const SETTINGS_SCHEDULE: RECT = rect(40, 168, 680, 216);
+const SETTINGS_EXCLUDE: RECT = rect(40, 232, 680, 280);
+const SETTINGS_BACKUP: RECT = rect(40, 328, 350, 376);
+const SETTINGS_RESTORE: RECT = rect(370, 328, 680, 376);
+const SETTINGS_UPDATE: RECT = rect(40, 526, 680, 578);
+
 static STATE: OnceLock<Arc<TrayState>> = OnceLock::new();
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static APP_ICON: AtomicIsize = AtomicIsize::new(0);
@@ -107,6 +141,10 @@ struct ViewState {
     protected: i64,
     folders: usize,
     pending: usize,
+    progress_files: usize,
+    progress_total: usize,
+    progress_bytes: u64,
+    progress_speed: u64,
 }
 
 struct TrayState {
@@ -118,11 +156,21 @@ struct TrayState {
     syncing: AtomicBool,
     dry_run: AtomicBool,
     paused: AtomicBool,
+    onboarding_completed: AtomicBool,
+    autostart_enabled: AtomicBool,
+    auto_update: AtomicBool,
+    takeout_imported_at: AtomicI64,
+    progress: Arc<OperationProgress>,
     positioned: AtomicBool,
     next_run: AtomicI64,
     selected: AtomicU32,
     hwnd: AtomicIsize,
     animation: AtomicU32,
+    setup_mode: AtomicBool,
+    working: AtomicBool,
+    pending_error: Mutex<Option<String>>,
+    settings_mode: AtomicBool,
+    update_ready: AtomicBool,
 }
 
 pub(super) fn run(
@@ -133,6 +181,13 @@ pub(super) fn run(
 ) -> super::AppResult<()> {
     let _tray_instance = SingleInstance::acquire_tray()?;
     let initial_sources = paths.sources.clone();
+    let initial_next_run = next_due_time(&initial_sources).min(unix_seconds() + 2);
+    let initial_paused = paths.paused;
+    let initial_onboarding_completed = paths.onboarding_completed;
+    let initial_autostart_enabled = paths.autostart_enabled;
+    let initial_auto_update = paths.auto_update;
+    let initial_takeout_imported_at = paths.takeout_imported_at.unwrap_or(0);
+    let initial_setup_mode = !initial_onboarding_completed || !state_ready_for_dashboard(&paths);
     let (protected, folders, pending) =
         counts(&paths, &initial_sources).unwrap_or((0, initial_sources.len(), 0));
     let state = Arc::new(TrayState {
@@ -147,15 +202,29 @@ pub(super) fn run(
             protected,
             folders,
             pending,
+            progress_files: 0,
+            progress_total: 0,
+            progress_bytes: 0,
+            progress_speed: 0,
         }),
         syncing: AtomicBool::new(false),
         dry_run: AtomicBool::new(false),
-        paused: AtomicBool::new(false),
+        paused: AtomicBool::new(initial_paused),
+        onboarding_completed: AtomicBool::new(initial_onboarding_completed),
+        autostart_enabled: AtomicBool::new(initial_autostart_enabled),
+        auto_update: AtomicBool::new(initial_auto_update),
+        takeout_imported_at: AtomicI64::new(initial_takeout_imported_at),
+        progress: Arc::new(OperationProgress::default()),
         positioned: AtomicBool::new(false),
-        next_run: AtomicI64::new(unix_seconds() + 2),
+        next_run: AtomicI64::new(initial_next_run),
         selected: AtomicU32::new(if folders == 0 { NO_SELECTION } else { 0 }),
         hwnd: AtomicIsize::new(0),
         animation: AtomicU32::new(0),
+        setup_mode: AtomicBool::new(initial_setup_mode),
+        working: AtomicBool::new(false),
+        pending_error: Mutex::new(None),
+        settings_mode: AtomicBool::new(false),
+        update_ready: AtomicBool::new(false),
     });
     STATE
         .set(state)
@@ -220,11 +289,37 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
         add_tray_icon(hwnd)?;
         SetTimer(hwnd, TIMER_SCHEDULE, 30_000, None);
         SetTimer(hwnd, TIMER_ANIMATION, 120, None);
-        if sync_on_start {
+        if STATE
+            .get()
+            .expect("tray state")
+            .auto_update
+            .load(Ordering::Acquire)
+            && !STATE
+                .get()
+                .expect("tray state")
+                .setup_mode
+                .load(Ordering::Acquire)
+        {
+            SetTimer(hwnd, TIMER_UPDATE, 20_000, None);
+        }
+        if sync_on_start
+            && !STATE
+                .get()
+                .expect("tray state")
+                .setup_mode
+                .load(Ordering::Acquire)
+        {
             SetTimer(hwnd, TIMER_INITIAL, 1_000, None);
         }
         refresh_source_list();
-        if show_on_start {
+        refresh_mode_controls();
+        if show_on_start
+            || STATE
+                .get()
+                .expect("tray state")
+                .setup_mode
+                .load(Ordering::Acquire)
+        {
             show_dashboard(hwnd);
         }
 
@@ -256,13 +351,28 @@ unsafe fn create_controls(hwnd: HWND, instance: HINSTANCE) -> super::AppResult<(
         (CMD_DRY_RUN, "Testlauf", BUTTON_DRY_RUN),
         (CMD_PAUSE, "Automatik pausieren", BUTTON_PAUSE),
         (CMD_OPEN_LOG, "Protokoll", BUTTON_OPEN_LOG),
+        (CMD_SETUP_GOOGLE, "Mit Google verbinden", SETUP_GOOGLE),
+        (CMD_SETUP_FOLDER, "Sicherungsordner auswählen", SETUP_FOLDER),
+        (
+            CMD_SETUP_TAKEOUT,
+            "Google Takeout importieren (optional)",
+            SETUP_TAKEOUT,
+        ),
+        (CMD_SETUP_AUTOSTART, "Mit Windows starten", SETUP_AUTOSTART),
+        (CMD_SETUP_FINISH, "Einrichtung abschließen", SETUP_FINISH),
+        (CMD_SETTINGS, "⋯", BUTTON_SETTINGS),
+        (CMD_SCHEDULE, "Zeitplan", SETTINGS_SCHEDULE),
+        (CMD_EXCLUDE, "Unterordner ausschließen", SETTINGS_EXCLUDE),
+        (CMD_BACKUP, "Daten sichern", SETTINGS_BACKUP),
+        (CMD_RESTORE, "Daten wiederherstellen", SETTINGS_RESTORE),
+        (CMD_UPDATE, "Nach Aktualisierung suchen", SETTINGS_UPDATE),
     ];
     for (id, label, rect) in buttons {
         let style = WS_CHILD
             | WS_VISIBLE
             | WS_TABSTOP
             | BS_NOTIFY as u32
-            | if id == CMD_SYNC {
+            | if matches!(id, CMD_SYNC | CMD_SETUP_FINISH) {
                 BS_DEFPUSHBUTTON as u32
             } else {
                 BS_PUSHBUTTON as u32
@@ -339,6 +449,7 @@ unsafe fn create_controls(hwnd: HWND, instance: HINSTANCE) -> super::AppResult<(
         CreateRoundRectRgn(0, 0, width(ALBUM_EDIT), height(ALBUM_EDIT), 12, 12),
         1,
     );
+    refresh_mode_controls();
     Ok(())
 }
 
@@ -399,6 +510,10 @@ unsafe extern "system" fn window_proc(
         WM_ERASEBKGND => 1,
         WM_TIMER => {
             handle_timer(hwnd, wparam);
+            0
+        }
+        WM_WORK_FINISHED => {
+            finish_background_work(wparam);
             0
         }
         WM_COMMAND => {
@@ -505,23 +620,65 @@ fn handle_timer(hwnd: HWND, timer: usize) {
         request_sync(false, false);
     } else if timer == TIMER_SCHEDULE {
         let state = STATE.get().expect("tray state");
-        if unix_seconds() >= state.next_run.load(Ordering::Acquire) {
+        if !state.setup_mode.load(Ordering::Acquire)
+            && unix_seconds() >= state.next_run.load(Ordering::Acquire)
+        {
             request_sync(false, false);
         }
         invalidate();
-    } else if timer == TIMER_ANIMATION
-        && STATE
-            .get()
-            .expect("tray state")
-            .syncing
+    } else if timer == TIMER_UPDATE {
+        unsafe { KillTimer(hwnd, TIMER_UPDATE) };
+        request_update();
+    } else if timer == TIMER_ANIMATION && {
+        let state = STATE.get().expect("tray state");
+        state.syncing.load(Ordering::Acquire) || state.working.load(Ordering::Acquire)
+    } {
+        let state = STATE.get().expect("tray state");
+        state.animation.fetch_add(1, Ordering::Relaxed);
+        let files = state.progress.files_done.load(Ordering::Acquire);
+        let total = state.progress.files_total.load(Ordering::Acquire);
+        let bytes = state
+            .progress
+            .bytes_done
             .load(Ordering::Acquire)
-    {
-        STATE
-            .get()
-            .expect("tray state")
-            .animation
-            .fetch_add(1, Ordering::Relaxed);
+            .min(state.progress.bytes_total.load(Ordering::Acquire));
+        let elapsed = (unix_seconds() - state.progress.started_at.load(Ordering::Acquire)).max(1);
+        if let Ok(mut view) = state.view.lock() {
+            view.progress_files = files;
+            view.progress_total = total;
+            view.progress_bytes = bytes;
+            view.progress_speed = bytes / elapsed as u64;
+            if total > 0 {
+                view.detail = format!(
+                    "{} / {} Dateien · {}/s",
+                    files,
+                    total,
+                    format_bytes(view.progress_speed)
+                );
+            }
+        }
         invalidate();
+    }
+}
+
+fn show_error_notification(detail: &str) {
+    let Some(state) = STATE.get() else { return };
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let mut data = NOTIFYICONDATAW {
+            cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+            hWnd: hwnd,
+            uID: TRAY_ID,
+            uFlags: NIF_INFO,
+            dwInfoFlags: NIIF_ERROR,
+            ..Default::default()
+        };
+        copy_wide(&mut data.szInfoTitle, "Google Photos Sync braucht Hilfe");
+        copy_wide(&mut data.szInfo, detail);
+        Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 }
 
@@ -623,7 +780,14 @@ fn show_dashboard(hwnd: HWND) {
             ShowWindow(hwnd, SW_SHOW);
         }
         SetForegroundWindow(hwnd);
-        SetFocus(GetDlgItem(hwnd, CMD_SYNC as i32));
+        let focus = if state.setup_mode.load(Ordering::Acquire) {
+            CMD_SETUP_FINISH
+        } else if state.settings_mode.load(Ordering::Acquire) {
+            CMD_SETTINGS
+        } else {
+            CMD_SYNC
+        };
+        SetFocus(GetDlgItem(hwnd, focus as i32));
         InvalidateRect(hwnd, null(), 0);
         UpdateWindow(hwnd);
     }
@@ -728,6 +892,17 @@ fn handle_command(hwnd: HWND, command: usize) {
         CMD_OPEN_SOURCE => open_selected_source(hwnd),
         CMD_TOGGLE_SOURCE => toggle_selected_source(),
         CMD_REMOVE_SOURCE => remove_selected_source(),
+        CMD_SETUP_GOOGLE => setup_google(hwnd),
+        CMD_SETUP_FOLDER => add_source(hwnd),
+        CMD_SETUP_TAKEOUT => setup_takeout(hwnd),
+        CMD_SETUP_AUTOSTART => toggle_autostart(),
+        CMD_SETUP_FINISH => finish_setup(),
+        CMD_SETTINGS => toggle_settings(),
+        CMD_SCHEDULE => cycle_schedule(),
+        CMD_EXCLUDE => exclude_subfolder(hwnd),
+        CMD_BACKUP => backup_database(hwnd),
+        CMD_RESTORE => restore_database(hwnd),
+        CMD_UPDATE => request_update(),
         CMD_OPEN_LOG => open_path(hwnd, &STATE.get().expect("tray state").paths.log),
         CMD_OPEN_PHOTOS => open_target(hwnd, "https://photos.google.com/"),
         CMD_EXIT => unsafe {
@@ -735,6 +910,561 @@ fn handle_command(hwnd: HWND, command: usize) {
         },
         _ => {}
     }
+}
+
+fn state_ready_for_dashboard(paths: &AppPaths) -> bool {
+    paths.credentials.is_file() && !paths.sources.is_empty()
+}
+
+fn refresh_mode_controls() {
+    let Some(state) = STATE.get() else { return };
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    let setup = state.setup_mode.load(Ordering::Acquire);
+    let settings = state.settings_mode.load(Ordering::Acquire);
+    let dashboard = [
+        CMD_ADD_SOURCE,
+        CMD_SOURCES,
+        CMD_ALBUM,
+        CMD_SAVE_ALBUM,
+        CMD_OPEN_SOURCE,
+        CMD_TOGGLE_SOURCE,
+        CMD_REMOVE_SOURCE,
+        CMD_SYNC,
+        CMD_DRY_RUN,
+        CMD_PAUSE,
+        CMD_OPEN_LOG,
+    ];
+    let setup_controls = [
+        CMD_SETUP_GOOGLE,
+        CMD_SETUP_FOLDER,
+        CMD_SETUP_TAKEOUT,
+        CMD_SETUP_AUTOSTART,
+        CMD_SETUP_FINISH,
+    ];
+    unsafe {
+        for id in dashboard {
+            ShowWindow(
+                GetDlgItem(hwnd, id as i32),
+                if setup || settings { SW_HIDE } else { SW_SHOW },
+            );
+        }
+        for id in setup_controls {
+            ShowWindow(
+                GetDlgItem(hwnd, id as i32),
+                if setup && !settings { SW_SHOW } else { SW_HIDE },
+            );
+        }
+        ShowWindow(
+            GetDlgItem(hwnd, CMD_SETTINGS as i32),
+            if setup { SW_HIDE } else { SW_SHOW },
+        );
+        for id in [
+            CMD_SCHEDULE,
+            CMD_EXCLUDE,
+            CMD_BACKUP,
+            CMD_RESTORE,
+            CMD_UPDATE,
+        ] {
+            ShowWindow(
+                GetDlgItem(hwnd, id as i32),
+                if settings { SW_SHOW } else { SW_HIDE },
+            );
+        }
+        ShowWindow(
+            GetDlgItem(hwnd, CMD_SETUP_AUTOSTART as i32),
+            if setup || settings { SW_SHOW } else { SW_HIDE },
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SETTINGS as i32),
+            wide(if settings { "←" } else { "⋯" }).as_ptr(),
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SETUP_GOOGLE as i32),
+            wide(if state.paths.credentials.is_file() {
+                "Google verbunden"
+            } else {
+                "Mit Google verbinden"
+            })
+            .as_ptr(),
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SETUP_FOLDER as i32),
+            wide(if state.sources.lock().expect("source state").is_empty() {
+                "Sicherungsordner auswählen"
+            } else {
+                "Weiteren Sicherungsordner auswählen"
+            })
+            .as_ptr(),
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SETUP_AUTOSTART as i32),
+            wide(if state.autostart_enabled.load(Ordering::Acquire) {
+                "Mit Windows starten: Ein"
+            } else {
+                "Mit Windows starten: Aus"
+            })
+            .as_ptr(),
+        );
+        let ready = !state.sources.lock().expect("source state").is_empty()
+            && state.paths.credentials.is_file();
+        EnableWindow(GetDlgItem(hwnd, CMD_SETUP_FINISH as i32), ready.into());
+        let source = selected_source();
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SCHEDULE as i32),
+            wide(&source.as_ref().map_or_else(
+                || "Zuerst einen Ordner auswählen".to_owned(),
+                |source| {
+                    format!(
+                        "Zeitplan für {}: {}",
+                        source.album,
+                        schedule_label(source.schedule_minutes)
+                    )
+                },
+            ))
+            .as_ptr(),
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_EXCLUDE as i32),
+            wide(&source.as_ref().map_or_else(
+                || "Zuerst einen Ordner auswählen".to_owned(),
+                |source| {
+                    format!(
+                        "Unterordner ausschließen · {} aktiv",
+                        source.excluded_subfolders.len()
+                    )
+                },
+            ))
+            .as_ptr(),
+        );
+        EnableWindow(
+            GetDlgItem(hwnd, CMD_SCHEDULE as i32),
+            source.is_some().into(),
+        );
+        EnableWindow(
+            GetDlgItem(hwnd, CMD_EXCLUDE as i32),
+            source.is_some().into(),
+        );
+    }
+    invalidate();
+}
+
+fn setup_google(hwnd: HWND) {
+    if STATE
+        .get()
+        .is_some_and(|state| state.working.swap(true, Ordering::AcqRel))
+    {
+        return;
+    }
+    let state = STATE.get().expect("tray state").clone();
+    state.progress.begin();
+    set_message("Google-Anmeldung", "Der Browser wird geöffnet");
+    let selected = if embedded_oauth_client().is_none() {
+        choose_json_file(hwnd)
+    } else {
+        None
+    };
+    if embedded_oauth_client().is_none() && selected.is_none() {
+        state.working.store(false, Ordering::Release);
+        return;
+    }
+    thread::spawn(move || {
+        let result = if let Some(client) = embedded_oauth_client() {
+            authorize_json(&state.paths, client)
+        } else {
+            authorize(
+                &state.paths,
+                selected.as_deref().expect("selected oauth file"),
+            )
+        };
+        *state.pending_error.lock().expect("background result") =
+            result.err().map(|error| error.to_string());
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                state.hwnd.load(Ordering::Acquire) as HWND,
+                WM_WORK_FINISHED,
+                WORK_GOOGLE,
+                0,
+            )
+        };
+    });
+}
+
+fn setup_takeout(hwnd: HWND) {
+    let Some(folder) = choose_folder_titled(hwnd, "Entpackten Google-Takeout-Ordner auswählen")
+    else {
+        return;
+    };
+    let state = STATE.get().expect("tray state").clone();
+    if state.working.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    set_message(
+        "Takeout wird eingelesen",
+        "Bestehende Inhalte werden lokal erkannt",
+    );
+    thread::spawn(move || {
+        let result = import_takeout(
+            &state.paths,
+            &state.logger,
+            &folder,
+            Some(state.progress.clone()),
+        );
+        *state.pending_error.lock().expect("background result") =
+            result.err().map(|error| error.to_string());
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                state.hwnd.load(Ordering::Acquire) as HWND,
+                WM_WORK_FINISHED,
+                WORK_TAKEOUT,
+                0,
+            )
+        };
+    });
+}
+
+fn toggle_autostart() {
+    let state = STATE.get().expect("tray state");
+    let enabled = !state.autostart_enabled.load(Ordering::Acquire);
+    match std::env::current_exe().and_then(|path| {
+        set_autostart_executable(&path, enabled)
+            .map_err(|error| io::Error::other(error.to_string()))
+    }) {
+        Ok(()) => {
+            state.autostart_enabled.store(enabled, Ordering::Release);
+            let _ = persist_sources();
+            refresh_mode_controls();
+        }
+        Err(error) => set_message("Autostart konnte nicht geändert werden", &error.to_string()),
+    }
+}
+
+fn finish_setup() {
+    let state = STATE.get().expect("tray state");
+    if !state.paths.credentials.is_file() || state.sources.lock().expect("source state").is_empty()
+    {
+        set_message(
+            "Einrichtung noch nicht fertig",
+            "Google verbinden und mindestens einen Ordner auswählen",
+        );
+        return;
+    }
+    state.onboarding_completed.store(true, Ordering::Release);
+    state.setup_mode.store(false, Ordering::Release);
+    let _ = persist_sources();
+    refresh_mode_controls();
+    refresh_source_list();
+    set_message("Bereit", "Nur neue Inhalte werden hochgeladen");
+}
+
+fn finish_background_work(kind: usize) {
+    let state = STATE.get().expect("tray state");
+    state.working.store(false, Ordering::Release);
+    if let Some(error) = state
+        .pending_error
+        .lock()
+        .expect("background result")
+        .take()
+    {
+        set_message("Aktion erforderlich", &error);
+        show_error_notification(&error);
+    } else if kind == WORK_GOOGLE {
+        set_message(
+            "Google verbunden",
+            "Die Zugangsdaten sind mit Windows geschützt",
+        );
+    } else if kind == WORK_TAKEOUT {
+        state
+            .takeout_imported_at
+            .store(unix_seconds(), Ordering::Release);
+        let _ = persist_sources();
+        set_message(
+            "Takeout importiert",
+            "Vorhandene Inhalte werden nicht erneut hochgeladen",
+        );
+    } else if kind == WORK_UPDATE {
+        if state.update_ready.load(Ordering::Acquire) {
+            set_message("Aktualisierung bereit", "Die App startet gleich neu");
+            unsafe { DestroyWindow(state.hwnd.load(Ordering::Acquire) as HWND) };
+            return;
+        }
+        set_message("Alles aktuell", "Du verwendest bereits die neueste Version");
+    }
+    refresh_mode_controls();
+    refresh_counts();
+}
+
+fn toggle_settings() {
+    let state = STATE.get().expect("tray state");
+    let open = !state.settings_mode.fetch_xor(true, Ordering::AcqRel);
+    if open {
+        set_message("Einstellungen", "Zeitpläne, Ausschlüsse und App-Daten");
+    }
+    refresh_mode_controls();
+}
+
+fn schedule_label(minutes: u32) -> String {
+    match minutes {
+        5 => "alle 5 Minuten".to_owned(),
+        15 => "alle 15 Minuten".to_owned(),
+        30 => "alle 30 Minuten".to_owned(),
+        60 => "stündlich".to_owned(),
+        180 => "alle 3 Stunden".to_owned(),
+        360 => "alle 6 Stunden".to_owned(),
+        720 => "alle 12 Stunden".to_owned(),
+        1440 => "täglich".to_owned(),
+        value => format!("alle {value} Minuten"),
+    }
+}
+
+fn cycle_schedule() {
+    const VALUES: &[u32] = &[5, 15, 30, 60, 180, 360, 720, 1440];
+    let state = STATE.get().expect("tray state");
+    let selected = state.selected.load(Ordering::Acquire) as usize;
+    let mut sources = state.sources.lock().expect("source state");
+    let Some(source) = sources.get_mut(selected) else {
+        return;
+    };
+    let index = VALUES
+        .iter()
+        .position(|value| *value == source.schedule_minutes)
+        .unwrap_or(1);
+    source.schedule_minutes = VALUES[(index + 1) % VALUES.len()];
+    let label = schedule_label(source.schedule_minutes);
+    drop(sources);
+    let _ = persist_sources();
+    set_message("Zeitplan gespeichert", &label);
+    refresh_mode_controls();
+}
+
+fn exclude_subfolder(hwnd: HWND) {
+    let Some(source) = selected_source() else {
+        return;
+    };
+    let Some(folder) = choose_folder_titled(hwnd, "Unterordner ausschließen") else {
+        return;
+    };
+    let root = normalized_path(&source.path);
+    let child = normalized_path(&folder);
+    if child == root || !child.starts_with(&(root.clone() + "\\")) {
+        set_message(
+            "Kein Unterordner",
+            "Der Ausschluss muss innerhalb des gewählten Sicherungsordners liegen",
+        );
+        return;
+    }
+    let state = STATE.get().expect("tray state");
+    let selected = state.selected.load(Ordering::Acquire) as usize;
+    let mut sources = state.sources.lock().expect("source state");
+    let Some(stored) = sources.get_mut(selected) else {
+        return;
+    };
+    if !stored
+        .excluded_subfolders
+        .iter()
+        .any(|existing| normalized_path(existing) == child)
+    {
+        stored.excluded_subfolders.push(folder);
+    }
+    drop(sources);
+    let _ = persist_sources();
+    set_message(
+        "Unterordner ausgeschlossen",
+        "Darin enthaltene Medien werden nicht hochgeladen",
+    );
+    refresh_counts();
+    refresh_mode_controls();
+}
+
+fn backup_database(hwnd: HWND) {
+    if STATE
+        .get()
+        .is_some_and(|state| state.syncing.load(Ordering::Acquire))
+    {
+        set_message(
+            "Sicherung läuft noch",
+            "App-Daten können danach gesichert werden",
+        );
+        return;
+    }
+    let Some(destination) = choose_folder_titled(hwnd, "Ziel für die Datensicherung auswählen")
+    else {
+        return;
+    };
+    let state = STATE.get().expect("tray state");
+    match create_backup(&state.paths, &destination) {
+        Ok(folder) => set_message("Datensicherung erstellt", &folder.to_string_lossy()),
+        Err(error) => set_message("Datensicherung fehlgeschlagen", &error.to_string()),
+    }
+}
+
+fn create_backup(paths: &AppPaths, destination: &Path) -> super::AppResult<PathBuf> {
+    if paths.database.is_file() {
+        let connection = open_database(&paths.database)?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    }
+    let folder = destination.join(format!("GooglePhotosSync-Backup-{}", unix_seconds()));
+    fs::create_dir_all(&folder)?;
+    for source in [&paths.config, &paths.database, &paths.credentials] {
+        if source.is_file() {
+            fs::copy(
+                source,
+                folder.join(source.file_name().ok_or("Ungültiger Dateiname")?),
+            )?;
+        }
+    }
+    fs::write(
+        folder.join("backup.json"),
+        format!("{{\"format\":1,\"created_at\":{}}}", unix_seconds()),
+    )?;
+    Ok(folder)
+}
+
+fn restore_database(hwnd: HWND) {
+    if STATE
+        .get()
+        .is_some_and(|state| state.syncing.load(Ordering::Acquire))
+    {
+        set_message(
+            "Sicherung läuft noch",
+            "App-Daten können danach wiederhergestellt werden",
+        );
+        return;
+    }
+    let Some(source) = choose_folder_titled(hwnd, "GooglePhotosSync-Backup auswählen") else {
+        return;
+    };
+    let state = STATE.get().expect("tray state");
+    match restore_backup(&state.paths, &source) {
+        Ok(()) => {
+            set_message("Daten wiederhergestellt", "Die App wird neu gestartet");
+            if let Ok(executable) = std::env::current_exe() {
+                let _ = std::process::Command::new(executable)
+                    .args(["restart-after", &std::process::id().to_string()])
+                    .spawn();
+            }
+            unsafe { DestroyWindow(hwnd) };
+        }
+        Err(error) => set_message("Wiederherstellung fehlgeschlagen", &error.to_string()),
+    }
+}
+
+fn restore_backup(paths: &AppPaths, source: &Path) -> super::AppResult<()> {
+    if !source.join("backup.json").is_file() || !source.join("gphotos-sync.json").is_file() {
+        return Err("Dies ist keine gültige Google Photos Sync-Datensicherung.".into());
+    }
+    fs::create_dir_all(&paths.root)?;
+    for name in [
+        "gphotos-sync.json",
+        "gphotos-rust.db",
+        "gphotos-rust.credentials",
+    ] {
+        let input = source.join(name);
+        if input.is_file() {
+            fs::copy(input, paths.root.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+fn request_update() {
+    let state = STATE.get().expect("tray state").clone();
+    if state.working.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    state.progress.begin();
+    set_message(
+        "Suche Aktualisierung",
+        "Die GitHub-Veröffentlichungen werden geprüft",
+    );
+    thread::spawn(move || {
+        let result = download_update(&state.paths);
+        match result {
+            Ok(ready) => state.update_ready.store(ready, Ordering::Release),
+            Err(error) => {
+                *state.pending_error.lock().expect("background result") = Some(error.to_string());
+            }
+        }
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                state.hwnd.load(Ordering::Acquire) as HWND,
+                WM_WORK_FINISHED,
+                WORK_UPDATE,
+                0,
+            )
+        };
+    });
+}
+
+fn download_update(paths: &AppPaths) -> super::AppResult<bool> {
+    let http = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .user_agent("google-photos-sync-rs-updater")
+        .build()?;
+    let release: serde_json::Value = http
+        .get("https://api.github.com/repos/Henner4746/google-photos-sync-rs/releases/latest")
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let tag = release
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let latest = tag.trim_start_matches('v');
+    if !version_is_newer(latest, env!("CARGO_PKG_VERSION")) {
+        return Ok(false);
+    }
+    let asset = release
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|assets| {
+            assets.iter().find(|asset| {
+                asset.get("name").and_then(serde_json::Value::as_str) == Some("gphotos-sync.exe")
+            })
+        })
+        .ok_or("Die neue Version enthält keine Windows-App.")?;
+    let url = asset
+        .get("browser_download_url")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("Downloadadresse der neuen Version fehlt.")?;
+    let expected = asset
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .ok_or("Die neue Version besitzt noch keinen prüfbaren SHA-256-Wert.")?;
+    let bytes = http.get(url).send()?.error_for_status()?.bytes()?;
+    let actual = hex_encode(&Sha256::digest(&bytes));
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err("Die heruntergeladene App hat eine ungültige Prüfsumme.".into());
+    }
+    let update_dir = paths.root.join("updates");
+    fs::create_dir_all(&update_dir)?;
+    let helper = update_dir.join(format!("gphotos-sync-{latest}.exe"));
+    fs::write(&helper, &bytes)?;
+    let target = std::env::current_exe()?;
+    std::process::Command::new(helper)
+        .arg("apply-update")
+        .arg(target)
+        .arg(std::process::id().to_string())
+        .spawn()?;
+    Ok(true)
+}
+
+fn version_is_newer(candidate: &str, current: &str) -> bool {
+    fn parts(value: &str) -> Vec<u64> {
+        value
+            .split('.')
+            .map(|part| part.split('-').next().unwrap_or("0").parse().unwrap_or(0))
+            .collect()
+    }
+    let mut candidate = parts(candidate);
+    let mut current = parts(current);
+    let length = candidate.len().max(current.len());
+    candidate.resize(length, 0);
+    current.resize(length, 0);
+    candidate > current
 }
 
 fn add_source(hwnd: HWND) {
@@ -766,6 +1496,9 @@ fn add_source(hwnd: HWND) {
         path,
         kind,
         enabled: true,
+        schedule_minutes: DEFAULT_SCHEDULE_MINUTES,
+        excluded_subfolders: Vec::new(),
+        last_successful_sync: 0,
     });
     let index = sources.len() - 1;
     drop(sources);
@@ -783,9 +1516,16 @@ fn add_source(hwnd: HWND) {
 }
 
 fn choose_folder(hwnd: HWND) -> Option<PathBuf> {
+    choose_folder_titled(
+        hwnd,
+        "Ordner f\u{00fc}r die Google-Photos-Sicherung ausw\u{00e4}hlen",
+    )
+}
+
+fn choose_folder_titled(hwnd: HWND, dialog_title: &str) -> Option<PathBuf> {
     unsafe {
         let mut display = [0_u16; 260];
-        let title = wide("Ordner f\u{00fc}r die Google-Photos-Sicherung ausw\u{00e4}hlen");
+        let title = wide(dialog_title);
         let info = BROWSEINFOW {
             hwndOwner: hwnd,
             pszDisplayName: display.as_mut_ptr(),
@@ -808,6 +1548,34 @@ fn choose_folder(hwnd: HWND) -> Option<PathBuf> {
             .position(|value| *value == 0)
             .unwrap_or(path.len());
         Some(PathBuf::from(String::from_utf16_lossy(&path[..length])))
+    }
+}
+
+fn choose_json_file(hwnd: HWND) -> Option<PathBuf> {
+    unsafe {
+        let mut file = [0_u16; 32_768];
+        let filter: Vec<u16> = "Google OAuth JSON\0*.json\0Alle Dateien\0*.*\0\0"
+            .encode_utf16()
+            .collect();
+        let title = wide("Google-OAuth-Datei ausw\u{00e4}hlen");
+        let mut dialog = OPENFILENAMEW {
+            lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: hwnd,
+            lpstrFilter: filter.as_ptr(),
+            lpstrFile: file.as_mut_ptr(),
+            nMaxFile: file.len() as u32,
+            lpstrTitle: title.as_ptr(),
+            Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST,
+            ..Default::default()
+        };
+        if GetOpenFileNameW(&mut dialog) == 0 {
+            return None;
+        }
+        let length = file
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(file.len());
+        Some(PathBuf::from(String::from_utf16_lossy(&file[..length])))
     }
 }
 
@@ -964,6 +1732,7 @@ fn toggle_pause() {
             "Die n\u{00e4}chste Pr\u{00fc}fung folgt innerhalb von 15 Minuten"
         },
     );
+    let _ = persist_sources();
     refresh_controls();
 }
 
@@ -1009,14 +1778,51 @@ fn request_sync(manual: bool, dry_run: bool) {
     refresh_controls();
 
     thread::spawn(move || {
-        let sources = state.sources.lock().expect("source state").clone();
+        let all_sources = state.sources.lock().expect("source state").clone();
+        let now = unix_seconds();
+        let sources: Vec<SourceSpec> = all_sources
+            .iter()
+            .filter(|source| {
+                manual
+                    || source.last_successful_sync == 0
+                    || now
+                        >= source.last_successful_sync
+                            + i64::from(source.schedule_minutes.max(5)) * 60
+            })
+            .cloned()
+            .collect();
+        if sources.is_empty() {
+            state
+                .next_run
+                .store(next_due_time(&all_sources), Ordering::Release);
+            state.syncing.store(false, Ordering::Release);
+            state.dry_run.store(false, Ordering::Release);
+            return;
+        }
         let mut paths = state.paths.clone();
         paths.sources = sources.clone();
+        let progress = state.progress.clone();
         let result = match SingleInstance::acquire() {
-            Ok(_instance) => sync(&paths, &state.logger, dry_run, None),
+            Ok(_instance) => sync(&paths, &state.logger, dry_run, None, Some(progress)),
             Err(error) => Err(error),
         };
-        let refreshed = counts(&paths, &sources).unwrap_or((0, sources.len(), 0));
+        if result.is_ok() && !dry_run {
+            let synced_paths: Vec<String> = sources
+                .iter()
+                .map(|source| normalized_path(&source.path))
+                .collect();
+            if let Ok(mut stored) = state.sources.lock() {
+                for source in stored.iter_mut() {
+                    if synced_paths.contains(&normalized_path(&source.path)) {
+                        source.last_successful_sync = unix_seconds();
+                    }
+                }
+            }
+            let _ = persist_sources();
+        }
+        let current_sources = state.sources.lock().expect("source state").clone();
+        let refreshed =
+            counts(&state.paths, &current_sources).unwrap_or((0, current_sources.len(), 0));
         if let Ok(mut view) = state.view.lock() {
             view.protected = refreshed.0;
             view.folders = refreshed.1;
@@ -1046,12 +1852,13 @@ fn request_sync(manual: bool, dry_run: bool) {
                 Err(error) => {
                     view.status = "Aktion erforderlich".to_owned();
                     view.detail = error.to_string();
+                    show_error_notification(&view.detail);
                 }
             }
         }
         state
             .next_run
-            .store(unix_seconds() + 15 * 60, Ordering::Release);
+            .store(next_due_time(&current_sources), Ordering::Release);
         state.syncing.store(false, Ordering::Release);
         state.dry_run.store(false, Ordering::Release);
         refresh_controls();
@@ -1063,7 +1870,19 @@ fn persist_sources() -> super::AppResult<()> {
     let state = STATE.get().expect("tray state");
     let sources = state.sources.lock().expect("source state").clone();
     let position = *state.window_position.lock().expect("window position");
-    save_sources(&state.paths.config, &sources, position)
+    save_config(
+        &state.paths.config,
+        &sources,
+        position,
+        state.paused.load(Ordering::Acquire),
+        state.onboarding_completed.load(Ordering::Acquire),
+        state.autostart_enabled.load(Ordering::Acquire),
+        state.auto_update.load(Ordering::Acquire),
+        match state.takeout_imported_at.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        },
+    )
 }
 
 fn refresh_source_list() {
@@ -1094,6 +1913,7 @@ fn refresh_source_list() {
         }
     }
     refresh_source_controls();
+    refresh_mode_controls();
     invalidate();
 }
 
@@ -1111,6 +1931,7 @@ fn update_selection() {
         Ordering::Release,
     );
     refresh_source_controls();
+    refresh_mode_controls();
     invalidate();
 }
 
@@ -1184,6 +2005,7 @@ fn refresh_controls() {
         InvalidateRect(hwnd, null(), 0);
     }
     refresh_source_controls();
+    refresh_mode_controls();
 }
 
 fn refresh_counts() {
@@ -1207,7 +2029,7 @@ fn counts(paths: &AppPaths, sources: &[SourceSpec]) -> super::AppResult<(i64, us
         if !source.path.is_dir() {
             continue;
         }
-        for path in source_files(&source.path, source.extensions())? {
+        for path in source_files_for_source(source)? {
             let metadata = fs::metadata(&path)?;
             let size = i64::try_from(metadata.len())?;
             let modified = super::modified_ns(&metadata)?;
@@ -1242,6 +2064,35 @@ fn normalized_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+fn next_due_time(sources: &[SourceSpec]) -> i64 {
+    let now = unix_seconds();
+    sources
+        .iter()
+        .filter(|source| source.enabled)
+        .map(|source| {
+            if source.last_successful_sync == 0 {
+                now
+            } else {
+                source.last_successful_sync + i64::from(source.schedule_minutes.max(5)) * 60
+            }
+        })
+        .min()
+        .unwrap_or(now + i64::from(DEFAULT_SCHEDULE_MINUTES) * 60)
+        .max(now)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    if bytes as f64 >= MB {
+        format!("{:.1} MB", bytes as f64 / MB)
+    } else if bytes as f64 >= KB {
+        format!("{:.0} KB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn read_control_text(hwnd: HWND) -> String {
     unsafe {
         let length = GetWindowTextLengthW(hwnd);
@@ -1273,6 +2124,12 @@ fn paint_dashboard(hwnd: HWND) {
             state.selected.load(Ordering::Acquire) != NO_SELECTION,
             state.animation.load(Ordering::Relaxed),
             state.next_run.load(Ordering::Acquire),
+            state.setup_mode.load(Ordering::Acquire),
+            state.paths.credentials.is_file(),
+            !state.sources.lock().expect("source state").is_empty(),
+            state.takeout_imported_at.load(Ordering::Acquire) > 0,
+            state.autostart_enabled.load(Ordering::Acquire),
+            state.settings_mode.load(Ordering::Acquire),
         );
     }
 }

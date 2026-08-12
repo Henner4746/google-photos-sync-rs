@@ -30,9 +30,9 @@
     <rect x="24" y="342" width="672" height="134" rx="12" fill="#1a1a1a"/>
     <rect x="24" y="342" width="672" height="58" fill="#2b2b2b"/>
     <text x="38" y="367" class="primary" font-size="15" font-weight="600">Screenshots</text><text x="682" y="366" text-anchor="end" class="secondary label">Aktiv  ·  Bilder</text>
-    <text x="38" y="389" class="muted label">E:\Screenshots</text>
+    <text x="38" y="389" class="muted label">C:\Users\Alex\Pictures\Screenshots</text>
     <text x="38" y="425" class="primary" font-size="15" font-weight="600">AMD-Clips</text><text x="682" y="424" text-anchor="end" class="secondary label">Aktiv  ·  Videos</text>
-    <text x="38" y="447" class="muted label">C:\Users\Henrik\Videos\Radeon ReLive</text>
+    <text x="38" y="447" class="muted label">C:\Users\Alex\Videos\Radeon ReLive</text>
 
     <rect x="24" y="492" width="672" height="76" rx="12" fill="#1a1a1a"/>
     <text x="40" y="512" class="muted label">Zielalbum für neue Medien</text><text x="40" y="534" class="primary label">Screenshots</text>
