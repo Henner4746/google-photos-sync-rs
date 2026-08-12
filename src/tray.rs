@@ -1261,11 +1261,22 @@ fn exclude_subfolder(hwnd: HWND) {
     let Some(stored) = sources.get_mut(selected) else {
         return;
     };
-    if !stored
+    if let Some(index) = stored
         .excluded_subfolders
         .iter()
-        .any(|existing| normalized_path(existing) == child)
+        .position(|existing| normalized_path(existing) == child)
     {
+        stored.excluded_subfolders.remove(index);
+        drop(sources);
+        let _ = persist_sources();
+        set_message(
+            "Ausschluss aufgehoben",
+            "Medien aus diesem Unterordner werden wieder berücksichtigt",
+        );
+        refresh_counts();
+        refresh_mode_controls();
+        return;
+    } else {
         stored.excluded_subfolders.push(folder);
     }
     drop(sources);

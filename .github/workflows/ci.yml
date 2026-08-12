@@ -22,3 +22,9 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      - name: Compile Windows installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\gphotos-sync.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

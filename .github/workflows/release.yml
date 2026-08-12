@@ -16,22 +16,30 @@ jobs:
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+      - name: Require production OAuth and signing secrets
+        shell: pwsh
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:GPHOTOS_SYNC_OAUTH_CLIENT_JSON)) { $missing += 'GPHOTOS_SYNC_OAUTH_CLIENT_JSON' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) { $missing += 'WINDOWS_CERTIFICATE_BASE64' }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) { $missing += 'WINDOWS_CERTIFICATE_PASSWORD' }
+          if ($missing.Count -gt 0) {
+            throw "Release blocked: configure $($missing -join ', ') before publishing."
+          }
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Sign application when a certificate is configured
+      - name: Sign application
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) {
-            "No signing certificate configured; producing an unsigned release."
-            exit 0
-          }
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
             Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f "$env:RUNNER_TEMP\codesign.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD target\release\gphotos-sync.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $signtool.FullName verify /pa /v target\release\gphotos-sync.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build installer
         shell: pwsh
@@ -39,13 +47,14 @@ jobs:
           choco install innosetup --no-progress -y
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\gphotos-sync.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Sign installer when a certificate is configured
+      - name: Sign installer
         shell: pwsh
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) { exit 0 }
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
             Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f "$env:RUNNER_TEMP\codesign.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD dist\Google-Photos-Sync-Setup.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $signtool.FullName verify /pa /v dist\Google-Photos-Sync-Setup.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Create checksums
         shell: pwsh
