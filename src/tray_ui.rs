@@ -1,22 +1,27 @@
-use super::ViewState;
+use super::{
+    CMD_CLOSE, CMD_OPEN_SOURCE, CMD_REMOVE_SOURCE, CMD_SAVE_ALBUM, CMD_SYNC, CMD_TOGGLE_SOURCE,
+    MediaKind, SourceSpec, ViewState,
+};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CreateFontW, CreateRoundRectRgn, CreateSolidBrush,
     DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, FillRgn, HDC,
-    HFONT, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
+    DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FW_SEMIBOLD, FillRect, FillRgn,
+    FrameRect, HDC, HFONT, PAINTSTRUCT, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW;
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowTextW};
 
-const SURFACE: u32 = tone(6);
+const SURFACE: u32 = tone(5);
 const SURFACE_CONTAINER: u32 = tone(10);
-const SURFACE_HIGH: u32 = tone(18);
-const OUTLINE: u32 = tone(24);
+const SURFACE_HIGH: u32 = tone(17);
+const SURFACE_HOVER: u32 = tone(23);
+const OUTLINE: u32 = tone(28);
 const TEXT_PRIMARY: u32 = tone(96);
-const TEXT_SECONDARY: u32 = tone(68);
-const TEXT_MUTED: u32 = tone(60);
+const TEXT_SECONDARY: u32 = tone(72);
+const TEXT_MUTED: u32 = tone(62);
 const PRIMARY: u32 = tone(96);
 const ON_PRIMARY: u32 = tone(4);
 
@@ -26,29 +31,23 @@ pub(super) unsafe fn paint(
     view: &ViewState,
     paused: bool,
     syncing: bool,
+    dry_run: bool,
+    has_selection: bool,
     animation: u32,
     next_run: i64,
 ) {
     unsafe {
         let mut paint = PAINTSTRUCT::default();
         let dc = BeginPaint(hwnd, &mut paint);
-        fill(
-            dc,
-            RECT {
-                left: 0,
-                top: 0,
-                right: 484,
-                bottom: 410,
-            },
-            SURFACE,
-        );
+        fill(dc, rect(0, 0, 720, 656), SURFACE);
         SetBkMode(dc, TRANSPARENT as i32);
-
         let fonts = Fonts::create();
         header(dc, paused, &fonts);
-        status_panel(dc, view, paused, syncing, animation, &fonts);
+        status_panel(
+            dc, view, paused, syncing, dry_run, animation, next_run, &fonts,
+        );
         metrics(dc, view, &fonts);
-        schedule_line(dc, view, paused, syncing, next_run, &fonts);
+        sources_panel(dc, view, has_selection, &fonts);
         fonts.destroy();
         EndPaint(hwnd, &paint);
     }
@@ -56,7 +55,8 @@ pub(super) unsafe fn paint(
 
 pub(super) unsafe fn paint_button(
     hwnd: HWND,
-    is_primary: bool,
+    command: usize,
+    hovered: bool,
     pressed: bool,
     focused: bool,
     disabled: bool,
@@ -64,50 +64,149 @@ pub(super) unsafe fn paint_button(
     unsafe {
         let mut paint = PAINTSTRUCT::default();
         let dc = BeginPaint(hwnd, &mut paint);
-        let rect = RECT {
-            left: 0,
-            top: 0,
-            right: 210,
-            bottom: 44,
-        };
+        let mut bounds = RECT::default();
+        GetClientRect(hwnd, &mut bounds);
         SetBkMode(dc, TRANSPARENT as i32);
-        let base = if is_primary { PRIMARY } else { SURFACE_HIGH };
-        let color = if disabled {
-            tone(28)
+
+        let detail_button = matches!(
+            command,
+            CMD_SAVE_ALBUM | CMD_OPEN_SOURCE | CMD_TOGGLE_SOURCE | CMD_REMOVE_SOURCE
+        );
+        fill(
+            dc,
+            bounds,
+            if detail_button {
+                SURFACE_CONTAINER
+            } else {
+                SURFACE
+            },
+        );
+        let primary = command == CMD_SYNC;
+        let bare = command == CMD_CLOSE;
+        let base = if primary { PRIMARY } else { SURFACE_HIGH };
+        let button_color = if disabled {
+            tone(25)
         } else if pressed {
-            shade(base, if is_primary { -18 } else { 10 })
+            if primary { tone(78) } else { tone(30) }
+        } else if hovered {
+            if primary { tone(88) } else { SURFACE_HOVER }
         } else {
             base
         };
 
-        fill(dc, rect, SURFACE);
-        if focused {
-            rounded_fill(dc, rect, 22, tone(76));
-            rounded_fill(dc, inset(rect, 2), 20, color);
-        } else {
-            rounded_fill(dc, rect, 22, color);
+        if !bare {
+            if focused {
+                rounded_fill(dc, bounds, bounds.bottom / 2, tone(76));
+                rounded_fill(dc, inset(bounds, 2), (bounds.bottom - 4) / 2, button_color);
+            } else {
+                rounded_fill(dc, bounds, bounds.bottom / 2, button_color);
+            }
+        } else if hovered || focused {
+            rounded_fill(dc, bounds, bounds.bottom / 2, SURFACE_HIGH);
         }
 
-        let mut buffer = [0_u16; 64];
+        let mut buffer = [0_u16; 96];
         let length = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
         let label = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-        let font = font(14, FW_SEMIBOLD);
+        let label_font = font(if bare { 21 } else { 14 }, FW_SEMIBOLD);
         text(
             dc,
             &label,
-            rect,
+            bounds,
             if disabled {
-                tone(58)
-            } else if is_primary {
+                tone(55)
+            } else if primary {
                 ON_PRIMARY
             } else {
                 TEXT_PRIMARY
             },
             DT_CENTER | DT_SINGLELINE | DT_VCENTER,
-            font,
+            label_font,
         );
-        DeleteObject(font);
+        DeleteObject(label_font);
         EndPaint(hwnd, &paint);
+    }
+}
+
+pub(super) unsafe fn paint_source_item(item: &DRAWITEMSTRUCT, source: Option<&SourceSpec>) {
+    let Some(source) = source else { return };
+    unsafe {
+        let selected = item.itemState & ODS_SELECTED != 0;
+        let focused = item.itemState & ODS_FOCUS != 0;
+        let bounds = item.rcItem;
+        fill(
+            item.hDC,
+            bounds,
+            if selected {
+                SURFACE_HIGH
+            } else {
+                SURFACE_CONTAINER
+            },
+        );
+        if focused {
+            let brush = CreateSolidBrush(tone(72));
+            FrameRect(item.hDC, &bounds, brush);
+            DeleteObject(brush);
+        }
+        let title_font = font(15, FW_SEMIBOLD);
+        let detail_font = font(12, FW_NORMAL);
+        text(
+            item.hDC,
+            &source.album,
+            rect(
+                bounds.left + 14,
+                bounds.top + 6,
+                bounds.right - 136,
+                bounds.top + 29,
+            ),
+            if source.enabled {
+                TEXT_PRIMARY
+            } else {
+                TEXT_SECONDARY
+            },
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            title_font,
+        );
+        text(
+            item.hDC,
+            &source.path.to_string_lossy(),
+            rect(
+                bounds.left + 14,
+                bounds.top + 29,
+                bounds.right - 14,
+                bounds.top + 53,
+            ),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            detail_font,
+        );
+        let kind = match source.kind {
+            MediaKind::Images => "Bilder",
+            MediaKind::Videos => "Videos",
+            MediaKind::All => "Alle Medien",
+        };
+        text(
+            item.hDC,
+            &format!(
+                "{}  ·  {kind}",
+                if source.enabled { "Aktiv" } else { "Pausiert" }
+            ),
+            rect(
+                bounds.right - 142,
+                bounds.top + 7,
+                bounds.right - 14,
+                bounds.top + 29,
+            ),
+            if source.enabled {
+                TEXT_SECONDARY
+            } else {
+                TEXT_MUTED
+            },
+            DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            detail_font,
+        );
+        DeleteObject(title_font);
+        DeleteObject(detail_font);
     }
 }
 
@@ -123,10 +222,10 @@ impl Fonts {
     unsafe fn create() -> Self {
         unsafe {
             Self {
-                title: font(24, FW_SEMIBOLD),
+                title: font(25, FW_SEMIBOLD),
                 heading: font(18, FW_SEMIBOLD),
-                body: font(15, FW_NORMAL),
-                label: font(13, FW_NORMAL),
+                body: font(14, FW_NORMAL),
+                label: font(12, FW_NORMAL),
                 metric: font(22, FW_SEMIBOLD),
             }
         }
@@ -147,118 +246,56 @@ unsafe fn header(dc: HDC, paused: bool, fonts: &Fonts) {
     unsafe {
         text(
             dc,
-            "Foto-Sicherung",
-            RECT {
-                left: 24,
-                top: 16,
-                right: 330,
-                bottom: 50,
-            },
+            "Google Photos Sync",
+            rect(24, 14, 440, 46),
             TEXT_PRIMARY,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.title,
         );
         text(
             dc,
-            "Google Fotos  \u{00b7}  lokal indiziert",
-            RECT {
-                left: 24,
-                top: 47,
-                right: 330,
-                bottom: 73,
-            },
+            "Sichert Ordner ohne doppelte Uploads",
+            rect(24, 46, 490, 70),
             TEXT_SECONDARY,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.body,
         );
-
+        rounded_fill(dc, rect(540, 21, 655, 53), 16, SURFACE_HIGH);
         rounded_fill(
             dc,
-            RECT {
-                left: 344,
-                top: 22,
-                right: 460,
-                bottom: 54,
-            },
-            16,
-            SURFACE_HIGH,
-        );
-        rounded_fill(
-            dc,
-            RECT {
-                left: 357,
-                top: 35,
-                right: 363,
-                bottom: 41,
-            },
+            rect(552, 34, 558, 40),
             3,
-            if paused { tone(62) } else { tone(92) },
+            if paused { tone(60) } else { tone(94) },
         );
         text(
             dc,
-            if paused {
-                "Pausiert"
-            } else {
-                "Autostart aktiv"
-            },
-            RECT {
-                left: 370,
-                top: 22,
-                right: 452,
-                bottom: 54,
-            },
-            if paused { tone(76) } else { tone(90) },
+            if paused { "Pausiert" } else { "Autostart" },
+            rect(566, 21, 647, 53),
+            if paused { TEXT_SECONDARY } else { TEXT_PRIMARY },
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.label,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn status_panel(
     dc: HDC,
     view: &ViewState,
     paused: bool,
     syncing: bool,
+    dry_run: bool,
     animation: u32,
+    next_run: i64,
     fonts: &Fonts,
 ) {
     unsafe {
-        rounded_fill(
-            dc,
-            RECT {
-                left: 24,
-                top: 86,
-                right: 460,
-                bottom: 187,
-            },
-            16,
-            SURFACE_CONTAINER,
-        );
-
+        rounded_fill(dc, rect(24, 86, 696, 190), 16, SURFACE_CONTAINER);
         let needs_attention = view.status == "Pruefen";
-        let status_color = if syncing {
-            TEXT_PRIMARY
-        } else if paused || needs_attention {
-            tone(64)
-        } else if view.pending == 0 {
-            tone(90)
-        } else {
-            tone(80)
-        };
-        rounded_fill(
-            dc,
-            RECT {
-                left: 40,
-                top: 109,
-                right: 50,
-                bottom: 119,
-            },
-            5,
-            status_color,
-        );
-
-        let headline = if syncing {
-            "Sicherung l\u{00e4}uft"
+        let headline = if syncing && dry_run {
+            "Testlauf prüft deine Ordner"
+        } else if syncing {
+            "Sicherung läuft"
         } else if paused {
             "Automatik pausiert"
         } else if needs_attention {
@@ -266,26 +303,33 @@ unsafe fn status_panel(
         } else if view.pending == 0 {
             "Alles gesichert"
         } else {
-            "Neue Dateien gefunden"
+            "Neue Medien gefunden"
         };
-        let detail = if syncing {
-            "Dateien werden gepr\u{00fc}ft und parallel \u{00fc}bertragen"
+        let detail = if syncing && dry_run {
+            "Es wird nichts hochgeladen oder in Google Fotos geändert"
+        } else if syncing {
+            "Nur neue Inhalte werden zu Google Fotos übertragen"
         } else if paused {
-            "Manuelle Sicherung bleibt jederzeit verf\u{00fc}gbar"
+            "Manuelle Sicherungen und Testläufe bleiben verfügbar"
         } else if view.pending == 0 {
-            "Keine neuen oder doppelten Medien"
+            "Vorhandene Bilder und Videos werden nicht erneut hochgeladen"
         } else {
             view.detail.as_str()
         };
+        rounded_fill(
+            dc,
+            rect(40, 108, 50, 118),
+            5,
+            if paused || needs_attention {
+                tone(64)
+            } else {
+                tone(94)
+            },
+        );
         text(
             dc,
             headline,
-            RECT {
-                left: 64,
-                top: 98,
-                right: 440,
-                bottom: 128,
-            },
+            rect(64, 97, 680, 128),
             TEXT_PRIMARY,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.heading,
@@ -293,100 +337,66 @@ unsafe fn status_panel(
         text(
             dc,
             detail,
-            RECT {
-                left: 40,
-                top: 133,
-                right: 440,
-                bottom: 160,
-            },
+            rect(40, 130, 680, 153),
             TEXT_SECONDARY,
             DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
             fonts.body,
         );
-
-        rounded_fill(
-            dc,
-            RECT {
-                left: 40,
-                top: 170,
-                right: 444,
-                bottom: 174,
-            },
-            2,
-            OUTLINE,
-        );
-        if syncing {
-            let left = 40 + ((animation as i32 * 17) % 284);
-            rounded_fill(
-                dc,
-                RECT {
-                    left,
-                    top: 170,
-                    right: left + 120,
-                    bottom: 174,
-                },
-                2,
-                status_color,
-            );
+        let next = if paused {
+            "Automatik angehalten".to_owned()
+        } else if syncing {
+            if dry_run {
+                "Schreibgeschützt"
+            } else {
+                "Übertragung aktiv"
+            }
+            .to_owned()
         } else {
-            let total = view.screenshots + view.clips + view.pending as i64;
-            let completed = view.screenshots + view.clips;
+            format!(
+                "Nächste Prüfung in {}",
+                countdown(next_run - crate::unix_seconds())
+            )
+        };
+        text(
+            dc,
+            &view.last_run,
+            rect(40, 153, 380, 176),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            &next,
+            rect(390, 153, 680, 176),
+            TEXT_MUTED,
+            DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        rounded_fill(dc, rect(40, 178, 680, 182), 2, OUTLINE);
+        if syncing {
+            let left = 40 + ((animation as i32 * 19) % 500);
+            rounded_fill(dc, rect(left, 178, left + 140, 182), 2, TEXT_PRIMARY);
+        } else {
+            let total = view.protected + view.pending as i64;
             let right = if total == 0 {
                 40
             } else {
-                40 + (404_i64 * completed / total) as i32
+                40 + (640_i64 * view.protected / total) as i32
             };
-            rounded_fill(
-                dc,
-                RECT {
-                    left: 40,
-                    top: 170,
-                    right: right.max(40),
-                    bottom: 174,
-                },
-                2,
-                status_color,
-            );
+            rounded_fill(dc, rect(40, 178, right.max(40), 182), 2, TEXT_PRIMARY);
         }
     }
 }
 
 unsafe fn metrics(dc: HDC, view: &ViewState, fonts: &Fonts) {
     unsafe {
-        rounded_fill(
-            dc,
-            RECT {
-                left: 24,
-                top: 205,
-                right: 460,
-                bottom: 274,
-            },
-            12,
-            SURFACE_CONTAINER,
-        );
-        fill(
-            dc,
-            RECT {
-                left: 169,
-                top: 218,
-                right: 170,
-                bottom: 261,
-            },
-            OUTLINE,
-        );
-        fill(
-            dc,
-            RECT {
-                left: 314,
-                top: 218,
-                right: 315,
-                bottom: 261,
-            },
-            OUTLINE,
-        );
-        metric(dc, "Screenshots", view.screenshots, 36, 157, fonts);
-        metric(dc, "AMD-Clips", view.clips, 182, 302, fonts);
-        metric(dc, "Noch offen", view.pending as i64, 327, 448, fonts);
+        rounded_fill(dc, rect(24, 206, 696, 274), 12, SURFACE_CONTAINER);
+        fill(dc, rect(247, 219, 248, 261), OUTLINE);
+        fill(dc, rect(471, 219, 472, 261), OUTLINE);
+        metric(dc, "Gesichert", view.protected, 40, 228, fonts);
+        metric(dc, "Ordner", view.folders as i64, 264, 452, fonts);
+        metric(dc, "Noch offen", view.pending as i64, 488, 680, fonts);
     }
 }
 
@@ -395,12 +405,7 @@ unsafe fn metric(dc: HDC, label: &str, value: i64, left: i32, right: i32, fonts:
         text(
             dc,
             label,
-            RECT {
-                left,
-                top: 212,
-                right,
-                bottom: 235,
-            },
+            rect(left, 211, right, 234),
             TEXT_MUTED,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.label,
@@ -408,12 +413,7 @@ unsafe fn metric(dc: HDC, label: &str, value: i64, left: i32, right: i32, fonts:
         text(
             dc,
             &value.to_string(),
-            RECT {
-                left,
-                top: 235,
-                right,
-                bottom: 265,
-            },
+            rect(left, 234, right, 266),
             TEXT_PRIMARY,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.metric,
@@ -421,69 +421,73 @@ unsafe fn metric(dc: HDC, label: &str, value: i64, left: i32, right: i32, fonts:
     }
 }
 
-unsafe fn schedule_line(
-    dc: HDC,
-    view: &ViewState,
-    paused: bool,
-    syncing: bool,
-    next_run: i64,
-    fonts: &Fonts,
-) {
+unsafe fn sources_panel(dc: HDC, view: &ViewState, has_selection: bool, fonts: &Fonts) {
     unsafe {
         text(
             dc,
-            &view.last_run,
-            RECT {
-                left: 24,
-                top: 286,
-                right: 270,
-                bottom: 316,
-            },
-            TEXT_MUTED,
-            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
-            fonts.label,
+            "Gesicherte Ordner",
+            rect(24, 294, 400, 334),
+            TEXT_PRIMARY,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.heading,
         );
-        let next_label = if paused {
-            "Automatik angehalten".to_owned()
-        } else if syncing {
-            "\u{00dc}bertragung aktiv".to_owned()
+        rounded_fill(dc, rect(24, 342, 696, 476), 12, SURFACE_CONTAINER);
+        if view.folders == 0 {
+            text(
+                dc,
+                "Noch keine Ordner",
+                rect(48, 365, 672, 398),
+                TEXT_PRIMARY,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                fonts.heading,
+            );
+            text(
+                dc,
+                "Füge einen Ordner mit Bildern oder Videos hinzu.",
+                rect(48, 399, 672, 430),
+                TEXT_SECONDARY,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                fonts.body,
+            );
+        }
+        if has_selection {
+            rounded_fill(dc, rect(24, 492, 696, 568), 12, SURFACE_CONTAINER);
+            text(
+                dc,
+                "Zielalbum für neue Medien",
+                rect(40, 495, 300, 518),
+                TEXT_MUTED,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+                fonts.label,
+            );
         } else {
-            format!(
-                "N\u{00e4}chste Pr\u{00fc}fung in {}",
-                countdown(next_run - crate::unix_seconds())
-            )
-        };
-        text(
-            dc,
-            &next_label,
-            RECT {
-                left: 270,
-                top: 286,
-                right: 460,
-                bottom: 316,
-            },
-            TEXT_MUTED,
-            DT_RIGHT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
-            fonts.label,
-        );
+            text(
+                dc,
+                "Wähle einen Ordner aus, um Zielalbum und Status zu ändern.",
+                rect(24, 492, 696, 568),
+                TEXT_MUTED,
+                DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                fonts.body,
+            );
+        }
     }
 }
 
-unsafe fn fill(dc: HDC, rect: RECT, color: u32) {
+unsafe fn fill(dc: HDC, area: RECT, color: u32) {
     let brush = unsafe { CreateSolidBrush(color) };
     unsafe {
-        FillRect(dc, &rect, brush);
+        FillRect(dc, &area, brush);
         DeleteObject(brush);
     }
 }
 
-unsafe fn rounded_fill(dc: HDC, rect: RECT, radius: i32, color: u32) {
+unsafe fn rounded_fill(dc: HDC, area: RECT, radius: i32, color: u32) {
     let region = unsafe {
         CreateRoundRectRgn(
-            rect.left,
-            rect.top,
-            rect.right + 1,
-            rect.bottom + 1,
+            area.left,
+            area.top,
+            area.right + 1,
+            area.bottom + 1,
             radius * 2,
             radius * 2,
         )
@@ -496,12 +500,12 @@ unsafe fn rounded_fill(dc: HDC, rect: RECT, radius: i32, color: u32) {
     }
 }
 
-unsafe fn text(dc: HDC, value: &str, mut rect: RECT, color: u32, flags: u32, font: HFONT) {
+unsafe fn text(dc: HDC, value: &str, mut area: RECT, color: u32, flags: u32, selected_font: HFONT) {
     let value = wide(value);
     unsafe {
-        let previous = SelectObject(dc, font);
+        let previous = SelectObject(dc, selected_font);
         SetTextColor(dc, color);
-        DrawTextW(dc, value.as_ptr(), -1, &mut rect, flags);
+        DrawTextW(dc, value.as_ptr(), -1, &mut area, flags);
         SelectObject(dc, previous);
     }
 }
@@ -531,35 +535,33 @@ unsafe fn font(height: i32, weight: u32) -> HFONT {
 fn countdown(seconds: i64) -> String {
     let seconds = seconds.max(0);
     if seconds < 60 {
-        format!("{} Sek.", seconds)
+        format!("{seconds} Sek.")
     } else {
         format!("{} Min.", (seconds + 59) / 60)
     }
 }
 
-fn inset(mut rect: RECT, amount: i32) -> RECT {
-    rect.left += amount;
-    rect.top += amount;
-    rect.right -= amount;
-    rect.bottom -= amount;
-    rect
+const fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+    RECT {
+        left,
+        top,
+        right,
+        bottom,
+    }
 }
 
-fn shade(color: u32, amount: i32) -> u32 {
-    let channel = |shift: u32| ((color >> shift) & 0xff) as i32;
-    rgb(
-        (channel(0) + amount).clamp(0, 255) as u32,
-        (channel(8) + amount).clamp(0, 255) as u32,
-        (channel(16) + amount).clamp(0, 255) as u32,
+const fn inset(area: RECT, amount: i32) -> RECT {
+    rect(
+        area.left + amount,
+        area.top + amount,
+        area.right - amount,
+        area.bottom - amount,
     )
 }
 
 const fn tone(value: u32) -> u32 {
-    rgb(value * 255 / 100, value * 255 / 100, value * 255 / 100)
-}
-
-const fn rgb(red: u32, green: u32, blue: u32) -> u32 {
-    red | (green << 8) | (blue << 16)
+    let channel = value * 255 / 100;
+    channel | (channel << 8) | (channel << 16)
 }
 
 fn wide(value: &str) -> Vec<u16> {

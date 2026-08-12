@@ -1,39 +1,55 @@
-use super::{AppPaths, Logger, SingleInstance, open_database, source_files, sync, unix_seconds};
-use rusqlite::params;
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use super::{
+    AppPaths, Logger, MediaKind, SingleInstance, SourceSpec, current_record, open_database,
+    save_sources, source_files, sync, trusted_state, unix_seconds,
+};
 use std::ffi::OsStr;
+use std::fs;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows_sys::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, CreateRoundRectRgn,
-    DIB_RGB_COLORS, DeleteObject, GetMonitorInfoW, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-    MONITORINFO, MonitorFromPoint, SetWindowRgn, UpdateWindow,
+    CreateSolidBrush, DEFAULT_GUI_FONT, DIB_RGB_COLORS, DeleteObject, GetMonitorInfoW,
+    GetStockObject, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    SetBkColor, SetTextColor, SetWindowRgn, UpdateWindow,
 };
+use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, VK_ESCAPE,
+    EnableWindow, GetFocus, IsWindowEnabled, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_ESCAPE,
 };
 use windows_sys::Win32::UI::Shell::{
-    DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-    NOTIFYICONIDENTIFIER, RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconGetRect,
-    Shell_NotifyIconW,
+    BIF_EDITBOX, BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW, DefSubclassProc, NIF_ICON,
+    NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER,
+    RemoveWindowSubclass, SHBrowseForFolderW, SHGetPathFromIDListW, SetWindowSubclass,
+    Shell_NotifyIconGetRect, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETSTATE, BN_CLICKED, BS_DEFPUSHBUTTON, BS_NOTIFY, BS_PUSHBUTTON, BST_PUSHED,
     CS_HREDRAW, CS_VREDRAW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetDlgCtrlID,
-    GetDlgItem, GetMessageW, HWND_TOPMOST, ICONINFO, IDC_ARROW, IsDialogMessageW, KillTimer,
-    LoadCursorW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SW_HIDE, SWP_SHOWWINDOW, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WA_INACTIVE, WM_ACTIVATE, WM_APP, WM_CLOSE, WM_COMMAND, WM_DESTROY,
-    WM_ENABLE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETFOCUS, WM_TIMER, WNDCLASSW, WS_CHILD,
-    WS_EX_CONTROLPARENT, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+    DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, GetCursorPos,
+    GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    HMENU, HTCAPTION, HTCLIENT, HWND_TOP, ICONINFO, IDC_ARROW, IDC_HAND, IsDialogMessageW,
+    KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
+    LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    LBS_OWNERDRAWFIXED, LoadCursorW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_SHOWWINDOW, SendMessageW,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND,
+    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
+    WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_CONTROLPARENT, WS_POPUP, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 #[path = "tray_ui.rs"]
@@ -48,44 +64,63 @@ const CMD_OPEN: usize = 1001;
 const CMD_SYNC: usize = 1002;
 const CMD_EXIT: usize = 1003;
 const CMD_PAUSE: usize = 1004;
-const WINDOW_WIDTH: i32 = 484;
-const WINDOW_HEIGHT: i32 = 410;
+const CMD_CLOSE: usize = 1005;
+const CMD_ADD_SOURCE: usize = 1006;
+const CMD_SOURCES: usize = 1007;
+const CMD_ALBUM: usize = 1008;
+const CMD_SAVE_ALBUM: usize = 1009;
+const CMD_OPEN_SOURCE: usize = 1010;
+const CMD_TOGGLE_SOURCE: usize = 1011;
+const CMD_REMOVE_SOURCE: usize = 1012;
+const CMD_DRY_RUN: usize = 1013;
+const CMD_OPEN_LOG: usize = 1014;
+const CMD_OPEN_PHOTOS: usize = 1015;
 
-const BUTTON_SYNC: RECT = RECT {
-    left: 24,
-    top: 338,
-    right: 234,
-    bottom: 382,
-};
-const BUTTON_PAUSE: RECT = RECT {
-    left: 250,
-    top: 338,
-    right: 460,
-    bottom: 382,
-};
+const WINDOW_WIDTH: i32 = 720;
+const WINDOW_HEIGHT: i32 = 656;
+const NO_SELECTION: u32 = u32::MAX;
+
+const BUTTON_CLOSE: RECT = rect(668, 20, 704, 56);
+const BUTTON_ADD: RECT = rect(526, 294, 696, 334);
+const SOURCE_LIST: RECT = rect(24, 342, 696, 476);
+const ALBUM_EDIT: RECT = rect(40, 518, 280, 554);
+const BUTTON_SAVE_ALBUM: RECT = rect(288, 518, 378, 554);
+const BUTTON_OPEN_SOURCE: RECT = rect(390, 518, 478, 554);
+const BUTTON_TOGGLE_SOURCE: RECT = rect(486, 518, 584, 554);
+const BUTTON_REMOVE_SOURCE: RECT = rect(592, 518, 680, 554);
+const BUTTON_SYNC: RECT = rect(24, 588, 236, 632);
+const BUTTON_DRY_RUN: RECT = rect(248, 588, 396, 632);
+const BUTTON_PAUSE: RECT = rect(408, 588, 562, 632);
+const BUTTON_OPEN_LOG: RECT = rect(574, 588, 696, 632);
 
 static STATE: OnceLock<Arc<TrayState>> = OnceLock::new();
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
-static FLYOUT_WAS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static APP_ICON: AtomicIsize = AtomicIsize::new(0);
+static CONTROL_BRUSH: AtomicIsize = AtomicIsize::new(0);
+static HOVERED_CONTROL: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone)]
 struct ViewState {
     status: String,
     detail: String,
     last_run: String,
-    screenshots: i64,
-    clips: i64,
+    protected: i64,
+    folders: usize,
     pending: usize,
 }
 
 struct TrayState {
     paths: AppPaths,
     logger: Arc<Logger>,
+    sources: Mutex<Vec<SourceSpec>>,
+    window_position: Mutex<Option<(i32, i32)>>,
     view: Mutex<ViewState>,
     syncing: AtomicBool,
+    dry_run: AtomicBool,
     paused: AtomicBool,
+    positioned: AtomicBool,
     next_run: AtomicI64,
+    selected: AtomicU32,
     hwnd: AtomicIsize,
     animation: AtomicU32,
 }
@@ -97,21 +132,28 @@ pub(super) fn run(
     sync_on_start: bool,
 ) -> super::AppResult<()> {
     let _tray_instance = SingleInstance::acquire_tray()?;
-    let (screenshots, clips, pending) = counts(&paths).unwrap_or((0, 0, 0));
+    let initial_sources = paths.sources.clone();
+    let (protected, folders, pending) =
+        counts(&paths, &initial_sources).unwrap_or((0, initial_sources.len(), 0));
     let state = Arc::new(TrayState {
+        window_position: Mutex::new(paths.window_position),
         paths,
         logger: Arc::new(logger),
+        sources: Mutex::new(initial_sources),
         view: Mutex::new(ViewState {
             status: "Bereit".to_owned(),
-            detail: "Keine doppelten Medien · 4 parallele Uploads".to_owned(),
+            detail: "Unver\u{00e4}nderte Medien bleiben vollst\u{00e4}ndig offline".to_owned(),
             last_run: "Noch kein Lauf in dieser Sitzung".to_owned(),
-            screenshots,
-            clips,
+            protected,
+            folders,
             pending,
         }),
         syncing: AtomicBool::new(false),
+        dry_run: AtomicBool::new(false),
         paused: AtomicBool::new(false),
+        positioned: AtomicBool::new(false),
         next_run: AtomicI64::new(unix_seconds() + 2),
+        selected: AtomicU32::new(if folders == 0 { NO_SELECTION } else { 0 }),
         hwnd: AtomicIsize::new(0),
         animation: AtomicU32::new(0),
     });
@@ -128,9 +170,8 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
             return Err(io::Error::last_os_error().into());
         }
         let class_name = wide("GooglePhotosSyncWindow");
-        let taskbar_message = wide("TaskbarCreated");
         TASKBAR_CREATED.store(
-            RegisterWindowMessageW(taskbar_message.as_ptr()),
+            RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             Ordering::Release,
         );
         let app_icon = create_app_icon();
@@ -147,11 +188,10 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
         if RegisterClassW(&window_class) == 0 {
             return Err(io::Error::last_os_error().into());
         }
-        let title = wide("Foto-Sicherung");
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
+            WS_EX_CONTROLPARENT,
             class_name.as_ptr(),
-            title.as_ptr(),
+            wide("Google Photos Sync").as_ptr(),
             WS_POPUP,
             0,
             0,
@@ -170,51 +210,20 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
             .expect("tray state")
             .hwnd
             .store(hwnd as isize, Ordering::Release);
-        let button_class = wide("BUTTON");
-        let sync_label = wide("Jetzt sichern");
-        let pause_label = wide("Pausieren");
-        let sync_button = CreateWindowExW(
-            0,
-            button_class.as_ptr(),
-            sync_label.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32 | BS_NOTIFY as u32,
-            BUTTON_SYNC.left,
-            BUTTON_SYNC.top,
-            BUTTON_SYNC.right - BUTTON_SYNC.left,
-            BUTTON_SYNC.bottom - BUTTON_SYNC.top,
+        CONTROL_BRUSH.store(CreateSolidBrush(gray(26)) as isize, Ordering::Release);
+        create_controls(hwnd, instance)?;
+        SetWindowRgn(
             hwnd,
-            CMD_SYNC as _,
-            instance,
-            null(),
+            CreateRoundRectRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_HEIGHT + 1, 28, 28),
+            1,
         );
-        let pause_button = CreateWindowExW(
-            0,
-            button_class.as_ptr(),
-            pause_label.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32 | BS_NOTIFY as u32,
-            BUTTON_PAUSE.left,
-            BUTTON_PAUSE.top,
-            BUTTON_PAUSE.right - BUTTON_PAUSE.left,
-            BUTTON_PAUSE.bottom - BUTTON_PAUSE.top,
-            hwnd,
-            CMD_PAUSE as _,
-            instance,
-            null(),
-        );
-        if sync_button.is_null() || pause_button.is_null() {
-            DestroyWindow(hwnd);
-            return Err(io::Error::last_os_error().into());
-        }
-        SetWindowSubclass(sync_button, Some(button_proc), CMD_SYNC, 0);
-        SetWindowSubclass(pause_button, Some(button_proc), CMD_PAUSE, 0);
-        let corner = CreateRoundRectRgn(0, 0, WINDOW_WIDTH + 1, WINDOW_HEIGHT + 1, 28, 28);
-        SetWindowRgn(hwnd, corner, 1);
         add_tray_icon(hwnd)?;
         SetTimer(hwnd, TIMER_SCHEDULE, 30_000, None);
         SetTimer(hwnd, TIMER_ANIMATION, 120, None);
         if sync_on_start {
             SetTimer(hwnd, TIMER_INITIAL, 1_000, None);
         }
+        refresh_source_list();
         if show_on_start {
             show_dashboard(hwnd);
         }
@@ -233,6 +242,104 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
         }
         Ok(())
     }
+}
+
+unsafe fn create_controls(hwnd: HWND, instance: HINSTANCE) -> super::AppResult<()> {
+    let buttons = [
+        (CMD_CLOSE, "\u{00d7}", BUTTON_CLOSE),
+        (CMD_ADD_SOURCE, "+  Ordner hinzuf\u{00fc}gen", BUTTON_ADD),
+        (CMD_SAVE_ALBUM, "Speichern", BUTTON_SAVE_ALBUM),
+        (CMD_OPEN_SOURCE, "\u{00d6}ffnen", BUTTON_OPEN_SOURCE),
+        (CMD_TOGGLE_SOURCE, "Pausieren", BUTTON_TOGGLE_SOURCE),
+        (CMD_REMOVE_SOURCE, "Entfernen", BUTTON_REMOVE_SOURCE),
+        (CMD_SYNC, "Jetzt sichern", BUTTON_SYNC),
+        (CMD_DRY_RUN, "Testlauf", BUTTON_DRY_RUN),
+        (CMD_PAUSE, "Automatik pausieren", BUTTON_PAUSE),
+        (CMD_OPEN_LOG, "Protokoll", BUTTON_OPEN_LOG),
+    ];
+    for (id, label, rect) in buttons {
+        let style = WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | BS_NOTIFY as u32
+            | if id == CMD_SYNC {
+                BS_DEFPUSHBUTTON as u32
+            } else {
+                BS_PUSHBUTTON as u32
+            };
+        let button = CreateWindowExW(
+            0,
+            wide("BUTTON").as_ptr(),
+            wide(label).as_ptr(),
+            style,
+            rect.left,
+            rect.top,
+            width(rect),
+            height(rect),
+            hwnd,
+            id as _,
+            instance,
+            null(),
+        );
+        if button.is_null() {
+            return Err(io::Error::last_os_error().into());
+        }
+        SetWindowSubclass(button, Some(button_proc), id, 0);
+    }
+
+    let list = CreateWindowExW(
+        0,
+        wide("LISTBOX").as_ptr(),
+        null(),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_TABSTOP
+            | WS_VSCROLL
+            | LBS_NOTIFY as u32
+            | LBS_OWNERDRAWFIXED as u32
+            | LBS_HASSTRINGS as u32
+            | LBS_NOINTEGRALHEIGHT as u32,
+        SOURCE_LIST.left,
+        SOURCE_LIST.top,
+        width(SOURCE_LIST),
+        height(SOURCE_LIST),
+        hwnd,
+        CMD_SOURCES as _,
+        instance,
+        null(),
+    );
+    let edit = CreateWindowExW(
+        0,
+        wide("EDIT").as_ptr(),
+        null(),
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        ALBUM_EDIT.left,
+        ALBUM_EDIT.top,
+        width(ALBUM_EDIT),
+        height(ALBUM_EDIT),
+        hwnd,
+        CMD_ALBUM as _,
+        instance,
+        null(),
+    );
+    if list.is_null() || edit.is_null() {
+        return Err(io::Error::last_os_error().into());
+    }
+    SendMessageW(list, LB_SETITEMHEIGHT, 0, 58);
+    let font = GetStockObject(DEFAULT_GUI_FONT);
+    SendMessageW(list, WM_SETFONT, font as usize, 1);
+    SendMessageW(edit, WM_SETFONT, font as usize, 1);
+    SetWindowRgn(
+        list,
+        CreateRoundRectRgn(0, 0, width(SOURCE_LIST), height(SOURCE_LIST), 12, 12),
+        1,
+    );
+    SetWindowRgn(
+        edit,
+        CreateRoundRectRgn(0, 0, width(ALBUM_EDIT), height(ALBUM_EDIT), 12, 12),
+        1,
+    );
+    Ok(())
 }
 
 unsafe extern "system" fn window_proc(
@@ -255,69 +362,81 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+        WM_NCHITTEST => {
+            let (_, screen_y) = screen_point(lparam);
+            let mut window = RECT::default();
+            GetWindowRect(hwnd, &mut window);
+            if screen_y - window.top < 76 {
+                HTCAPTION as LRESULT
+            } else {
+                HTCLIENT as LRESULT
+            }
+        }
+        WM_EXITSIZEMOVE => {
+            persist_window_position(hwnd);
+            0
+        }
         WM_PAINT => {
             paint_dashboard(hwnd);
             0
         }
-        WM_ERASEBKGND => 1,
-        WM_ACTIVATE if wparam as u32 & 0xffff == WA_INACTIVE => {
-            if FLYOUT_WAS_ACTIVE.swap(false, Ordering::AcqRel) {
-                unsafe { ShowWindow(hwnd, SW_HIDE) };
-            }
-            0
-        }
-        WM_ACTIVATE => {
-            FLYOUT_WAS_ACTIVE.store(true, Ordering::Release);
-            0
-        }
-        WM_TIMER => {
-            if wparam == TIMER_INITIAL {
-                unsafe { KillTimer(hwnd, TIMER_INITIAL) };
-                request_sync(false);
-            } else if wparam == TIMER_SCHEDULE {
+        WM_DRAWITEM => {
+            let item = &*(lparam as *const DRAWITEMSTRUCT);
+            if item.CtlID as usize == CMD_SOURCES {
                 let state = STATE.get().expect("tray state");
-                if unix_seconds() >= state.next_run.load(Ordering::Acquire) {
-                    request_sync(false);
-                }
-                invalidate();
-            } else if wparam == TIMER_ANIMATION
-                && STATE
-                    .get()
-                    .expect("tray state")
-                    .syncing
-                    .load(Ordering::Acquire)
-            {
-                STATE
-                    .get()
-                    .expect("tray state")
-                    .animation
-                    .fetch_add(1, Ordering::Relaxed);
-                invalidate();
+                let sources = state.sources.lock().expect("source state");
+                ui::paint_source_item(item, sources.get(item.itemID as usize));
+                return 1;
             }
+            0
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            let dc = wparam as _;
+            SetBkColor(dc, gray(26));
+            SetTextColor(dc, gray(238));
+            CONTROL_BRUSH.load(Ordering::Acquire) as LRESULT
+        }
+        WM_ERASEBKGND => 1,
+        WM_TIMER => {
+            handle_timer(hwnd, wparam);
             0
         }
         WM_COMMAND => {
             let command = wparam & 0xffff;
             let notification = (wparam >> 16) as u32;
-            if notification == BN_CLICKED || command == CMD_OPEN || command == CMD_EXIT {
+            if command == CMD_SOURCES {
+                if notification == LBN_SELCHANGE {
+                    update_selection();
+                } else if notification == LBN_DBLCLK {
+                    open_selected_source(hwnd);
+                }
+            } else if command == CMD_ALBUM && notification == EN_CHANGE {
+                EnableWindow(GetDlgItem(hwnd, CMD_SAVE_ALBUM as i32), 1);
+            } else if notification == BN_CLICKED
+                || matches!(command, CMD_OPEN | CMD_EXIT | CMD_OPEN_PHOTOS)
+            {
                 handle_command(hwnd, command);
             }
             0
         }
         WM_CLOSE => {
-            unsafe { ShowWindow(hwnd, SW_HIDE) };
+            ShowWindow(hwnd, SW_HIDE);
             0
         }
         WM_DESTROY => {
             remove_tray_icon(hwnd);
             let icon = APP_ICON.swap(0, Ordering::AcqRel);
             if icon != 0 {
-                unsafe { DestroyIcon(icon as _) };
+                DestroyIcon(icon as _);
             }
-            unsafe { PostQuitMessage(0) };
+            let brush = CONTROL_BRUSH.swap(0, Ordering::AcqRel);
+            if brush != 0 {
+                DeleteObject(brush as _);
+            }
+            PostQuitMessage(0);
             0
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
 
@@ -331,31 +450,78 @@ unsafe extern "system" fn button_proc(
 ) -> LRESULT {
     match message {
         WM_PAINT => {
-            let state = STATE.get().expect("tray state");
-            let pressed = unsafe { SendMessageW(hwnd, BM_GETSTATE, 0, 0) } as u32 & BST_PUSHED != 0;
-            unsafe {
-                ui::paint_button(
-                    hwnd,
-                    GetDlgCtrlID(hwnd) as usize == CMD_SYNC,
-                    pressed,
-                    GetFocus() == hwnd,
-                    IsWindowEnabled(hwnd) == 0,
-                )
-            };
-            let _ = state;
+            let pressed = SendMessageW(hwnd, BM_GETSTATE, 0, 0) as u32 & BST_PUSHED != 0;
+            ui::paint_button(
+                hwnd,
+                GetDlgCtrlID(hwnd) as usize,
+                HOVERED_CONTROL.load(Ordering::Acquire) as usize == GetDlgCtrlID(hwnd) as usize,
+                pressed,
+                GetFocus() == hwnd,
+                IsWindowEnabled(hwnd) == 0,
+            );
             0
+        }
+        WM_MOUSEMOVE => {
+            let id = GetDlgCtrlID(hwnd) as u32;
+            if HOVERED_CONTROL.swap(id, Ordering::AcqRel) != id {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            let mut tracking = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tracking);
+            DefSubclassProc(hwnd, message, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            let id = GetDlgCtrlID(hwnd) as u32;
+            let _ = HOVERED_CONTROL.compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire);
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_SETCURSOR => {
+            SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+            1
         }
         WM_ERASEBKGND => 1,
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
-            let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
-            unsafe { InvalidateRect(hwnd, null(), 0) };
+            let result = DefSubclassProc(hwnd, message, wparam, lparam);
+            InvalidateRect(hwnd, null(), 0);
             result
         }
         WM_NCDESTROY => {
-            unsafe { RemoveWindowSubclass(hwnd, Some(button_proc), subclass_id) };
-            unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+            RemoveWindowSubclass(hwnd, Some(button_proc), subclass_id);
+            DefSubclassProc(hwnd, message, wparam, lparam)
         }
-        _ => unsafe { DefSubclassProc(hwnd, message, wparam, lparam) },
+        _ => DefSubclassProc(hwnd, message, wparam, lparam),
+    }
+}
+
+fn handle_timer(hwnd: HWND, timer: usize) {
+    if timer == TIMER_INITIAL {
+        unsafe { KillTimer(hwnd, TIMER_INITIAL) };
+        request_sync(false, false);
+    } else if timer == TIMER_SCHEDULE {
+        let state = STATE.get().expect("tray state");
+        if unix_seconds() >= state.next_run.load(Ordering::Acquire) {
+            request_sync(false, false);
+        }
+        invalidate();
+    } else if timer == TIMER_ANIMATION
+        && STATE
+            .get()
+            .expect("tray state")
+            .syncing
+            .load(Ordering::Acquire)
+    {
+        STATE
+            .get()
+            .expect("tray state")
+            .animation
+            .fetch_add(1, Ordering::Relaxed);
+        invalidate();
     }
 }
 
@@ -370,7 +536,7 @@ fn add_tray_icon(hwnd: HWND) -> super::AppResult<()> {
             hIcon: APP_ICON.load(Ordering::Acquire) as _,
             ..Default::default()
         };
-        copy_wide(&mut data.szTip, "Google Fotos Sync · bereit");
+        copy_wide(&mut data.szTip, "Google Photos Sync \u{00b7} bereit");
         if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
             return Err(io::Error::last_os_error().into());
         }
@@ -415,28 +581,23 @@ fn create_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
                 let dx = x - 16;
                 let dy = y - 16;
                 let distance = dx * dx + dy * dy;
-                let outline = (62..=142).contains(&distance);
                 let ring = (76..=126).contains(&distance);
-                let forward_arrow = (20..=27).contains(&x) && (6..=13).contains(&y) && x + y >= 31;
-                let back_arrow = (5..=12).contains(&x) && (19..=26).contains(&y) && x + y <= 31;
-                let pixel = if ring || forward_arrow || back_arrow {
+                let forward = (20..=27).contains(&x) && (6..=13).contains(&y) && x + y >= 31;
+                let back = (5..=12).contains(&x) && (19..=26).contains(&y) && x + y <= 31;
+                pixels[(y * 32 + x) as usize] = if ring || forward || back {
                     0xff_f2_f2_f2
-                } else if outline {
-                    0xff_22_22_22
                 } else {
                     0
                 };
-                pixels[(y * 32 + x) as usize] = pixel;
             }
         }
         let mask = CreateBitmap(32, 32, 1, 1, null());
-        let icon_info = ICONINFO {
+        let icon = CreateIconIndirect(&ICONINFO {
             fIcon: 1,
             hbmColor: color,
             hbmMask: mask,
             ..Default::default()
-        };
-        let icon = CreateIconIndirect(&icon_info);
+        });
         DeleteObject(color);
         DeleteObject(mask);
         icon
@@ -444,6 +605,35 @@ fn create_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
 }
 
 fn show_dashboard(hwnd: HWND) {
+    let state = STATE.get().expect("tray state");
+    unsafe {
+        refresh_controls();
+        if !state.positioned.swap(true, Ordering::AcqRel) {
+            let (x, y) = initial_window_position(hwnd);
+            SetWindowPos(
+                hwnd,
+                HWND_TOP,
+                x,
+                y,
+                WINDOW_WIDTH,
+                WINDOW_HEIGHT,
+                SWP_SHOWWINDOW,
+            );
+        } else {
+            ShowWindow(hwnd, SW_SHOW);
+        }
+        SetForegroundWindow(hwnd);
+        SetFocus(GetDlgItem(hwnd, CMD_SYNC as i32));
+        InvalidateRect(hwnd, null(), 0);
+        UpdateWindow(hwnd);
+    }
+}
+
+fn initial_window_position(hwnd: HWND) -> (i32, i32) {
+    let state = STATE.get().expect("tray state");
+    if let Some(position) = *state.window_position.lock().expect("window position") {
+        return clamp_to_monitor(position.0, position.1);
+    }
     unsafe {
         let identifier = NOTIFYICONIDENTIFIER {
             cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
@@ -455,56 +645,37 @@ fn show_dashboard(hwnd: HWND) {
         if Shell_NotifyIconGetRect(&identifier, &mut icon) < 0 {
             let mut cursor = POINT::default();
             GetCursorPos(&mut cursor);
-            icon = RECT {
-                left: cursor.x,
-                top: cursor.y,
-                right: cursor.x + 1,
-                bottom: cursor.y + 1,
-            };
+            return clamp_to_monitor(cursor.x - WINDOW_WIDTH, cursor.y - WINDOW_HEIGHT);
         }
-        let monitor = MonitorFromPoint(
-            POINT {
-                x: icon.left,
-                y: icon.top,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        );
+        clamp_to_monitor(icon.right - WINDOW_WIDTH, icon.top - WINDOW_HEIGHT - 10)
+    }
+}
+
+fn clamp_to_monitor(x: i32, y: i32) -> (i32, i32) {
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
         GetMonitorInfoW(monitor, &mut info);
-        let margin = 10;
-        let x = (icon.right - WINDOW_WIDTH).clamp(
-            info.rcWork.left + margin,
-            info.rcWork.right - WINDOW_WIDTH - margin,
-        );
-        let y = if icon.top >= info.rcWork.bottom {
-            info.rcWork.bottom - WINDOW_HEIGHT - margin
-        } else if icon.bottom <= info.rcWork.top {
-            info.rcWork.top + margin
-        } else {
-            (icon.bottom - WINDOW_HEIGHT).clamp(
-                info.rcWork.top + margin,
-                info.rcWork.bottom - WINDOW_HEIGHT - margin,
-            )
-        };
-        refresh_controls();
-        FLYOUT_WAS_ACTIVE.store(false, Ordering::Release);
-        SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            x,
-            y,
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
-            SWP_SHOWWINDOW,
-        );
-        SetForegroundWindow(hwnd);
-        SetFocus(GetDlgItem(hwnd, CMD_SYNC as i32));
-        InvalidateRect(hwnd, null(), 0);
-        UpdateWindow(hwnd);
+        (
+            x.clamp(info.rcWork.left, info.rcWork.right - WINDOW_WIDTH),
+            y.clamp(info.rcWork.top, info.rcWork.bottom - WINDOW_HEIGHT),
+        )
     }
+}
+
+fn persist_window_position(hwnd: HWND) {
+    let state = STATE.get().expect("tray state");
+    unsafe {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect) == 0 {
+            return;
+        }
+        *state.window_position.lock().expect("window position") = Some((rect.left, rect.top));
+    }
+    let _ = persist_sources();
 }
 
 fn tray_menu(hwnd: HWND) {
@@ -513,13 +684,15 @@ fn tray_menu(hwnd: HWND) {
         if menu.is_null() {
             return;
         }
-        let open = wide("Dashboard oeffnen");
-        let sync = wide("Jetzt synchronisieren");
-        let exit = wide("Beenden");
-        AppendMenuW(menu, MF_STRING, CMD_OPEN, open.as_ptr());
-        AppendMenuW(menu, MF_STRING, CMD_SYNC, sync.as_ptr());
+        append_menu(menu, CMD_OPEN, "App \u{00f6}ffnen");
+        append_menu(menu, CMD_ADD_SOURCE, "Ordner hinzuf\u{00fc}gen");
+        append_menu(menu, CMD_SYNC, "Jetzt sichern");
+        append_menu(menu, CMD_DRY_RUN, "Testlauf ohne Uploads");
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        AppendMenuW(menu, MF_STRING, CMD_EXIT, exit.as_ptr());
+        append_menu(menu, CMD_OPEN_PHOTOS, "Google Photos \u{00f6}ffnen");
+        append_menu(menu, CMD_OPEN_LOG, "Protokoll \u{00f6}ffnen");
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        append_menu(menu, CMD_EXIT, "Beenden");
         let mut point = POINT::default();
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
@@ -537,11 +710,26 @@ fn tray_menu(hwnd: HWND) {
     }
 }
 
+unsafe fn append_menu(menu: HMENU, id: usize, label: &str) {
+    unsafe { AppendMenuW(menu, MF_STRING, id, wide(label).as_ptr()) };
+}
+
 fn handle_command(hwnd: HWND, command: usize) {
     match command {
         CMD_OPEN => show_dashboard(hwnd),
-        CMD_SYNC => request_sync(true),
+        CMD_CLOSE => unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        },
+        CMD_SYNC => request_sync(true, false),
+        CMD_DRY_RUN => request_sync(true, true),
         CMD_PAUSE => toggle_pause(),
+        CMD_ADD_SOURCE => add_source(hwnd),
+        CMD_SAVE_ALBUM => save_album_name(),
+        CMD_OPEN_SOURCE => open_selected_source(hwnd),
+        CMD_TOGGLE_SOURCE => toggle_selected_source(),
+        CMD_REMOVE_SOURCE => remove_selected_source(),
+        CMD_OPEN_LOG => open_path(hwnd, &STATE.get().expect("tray state").paths.log),
+        CMD_OPEN_PHOTOS => open_target(hwnd, "https://photos.google.com/"),
         CMD_EXIT => unsafe {
             DestroyWindow(hwnd);
         },
@@ -549,25 +737,253 @@ fn handle_command(hwnd: HWND, command: usize) {
     }
 }
 
+fn add_source(hwnd: HWND) {
+    let Some(path) = choose_folder(hwnd) else {
+        return;
+    };
+    let state = STATE.get().expect("tray state");
+    let mut sources = state.sources.lock().expect("source state");
+    let key = normalized_path(&path);
+    if sources
+        .iter()
+        .any(|source| normalized_path(&source.path) == key)
+    {
+        set_message(
+            "Bereits hinzugef\u{00fc}gt",
+            "Dieser Ordner wird schon gesichert",
+        );
+        return;
+    }
+    let album = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Gesicherte Medien")
+        .to_owned();
+    let kind = detect_media_kind(&path);
+    sources.push(SourceSpec {
+        album,
+        path,
+        kind,
+        enabled: true,
+    });
+    let index = sources.len() - 1;
+    drop(sources);
+    state.selected.store(index as u32, Ordering::Release);
+    if let Err(error) = persist_sources() {
+        set_message("Ordner nicht gespeichert", &error.to_string());
+        return;
+    }
+    refresh_source_list();
+    refresh_counts();
+    set_message(
+        "Ordner hinzugef\u{00fc}gt",
+        "Neue Medien werden beim n\u{00e4}chsten Lauf gepr\u{00fc}ft",
+    );
+}
+
+fn choose_folder(hwnd: HWND) -> Option<PathBuf> {
+    unsafe {
+        let mut display = [0_u16; 260];
+        let title = wide("Ordner f\u{00fc}r die Google-Photos-Sicherung ausw\u{00e4}hlen");
+        let info = BROWSEINFOW {
+            hwndOwner: hwnd,
+            pszDisplayName: display.as_mut_ptr(),
+            lpszTitle: title.as_ptr(),
+            ulFlags: BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX,
+            ..Default::default()
+        };
+        let item = SHBrowseForFolderW(&info);
+        if item.is_null() {
+            return None;
+        }
+        let mut path = [0_u16; 32_768];
+        let ok = SHGetPathFromIDListW(item, path.as_mut_ptr());
+        CoTaskMemFree(item.cast());
+        if ok == 0 {
+            return None;
+        }
+        let length = path
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(path.len());
+        Some(PathBuf::from(String::from_utf16_lossy(&path[..length])))
+    }
+}
+
+fn detect_media_kind(path: &Path) -> MediaKind {
+    let images = source_files(path, super::IMAGE_EXTENSIONS)
+        .map(|files| files.len())
+        .unwrap_or(0);
+    let videos = source_files(path, super::VIDEO_EXTENSIONS)
+        .map(|files| files.len())
+        .unwrap_or(0);
+    match (images > 0, videos > 0) {
+        (true, false) => MediaKind::Images,
+        (false, true) => MediaKind::Videos,
+        _ => MediaKind::All,
+    }
+}
+
+fn save_album_name() {
+    let state = STATE.get().expect("tray state");
+    let selected = state.selected.load(Ordering::Acquire);
+    if selected == NO_SELECTION {
+        return;
+    }
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    let value = read_control_text(unsafe { GetDlgItem(hwnd, CMD_ALBUM as i32) });
+    let value = value.trim();
+    if value.is_empty() {
+        set_message(
+            "Albumname fehlt",
+            "Gib einen Namen f\u{00fc}r neue Medien ein",
+        );
+        return;
+    }
+    if value.chars().count() > 500 {
+        set_message(
+            "Albumname ist zu lang",
+            "Google Photos erlaubt h\u{00f6}chstens 500 Zeichen",
+        );
+        return;
+    }
+    let mut sources = state.sources.lock().expect("source state");
+    let Some(source) = sources.get_mut(selected as usize) else {
+        return;
+    };
+    source.album = value.to_owned();
+    drop(sources);
+    if let Err(error) = persist_sources() {
+        set_message("Albumname nicht gespeichert", &error.to_string());
+        return;
+    }
+    refresh_source_list();
+    set_message(
+        "Zielalbum gespeichert",
+        "Neue Medien aus diesem Ordner verwenden den neuen Namen",
+    );
+}
+
+fn toggle_selected_source() {
+    let state = STATE.get().expect("tray state");
+    let selected = state.selected.load(Ordering::Acquire);
+    let mut sources = state.sources.lock().expect("source state");
+    let Some(source) = sources.get_mut(selected as usize) else {
+        return;
+    };
+    source.enabled = !source.enabled;
+    let enabled = source.enabled;
+    drop(sources);
+    let _ = persist_sources();
+    refresh_source_list();
+    refresh_counts();
+    set_message(
+        if enabled {
+            "Ordner aktiviert"
+        } else {
+            "Ordner pausiert"
+        },
+        if enabled {
+            "Er wird beim n\u{00e4}chsten Lauf wieder ber\u{00fc}cksichtigt"
+        } else {
+            "Seine Medien bleiben in Google Photos erhalten"
+        },
+    );
+}
+
+fn remove_selected_source() {
+    let state = STATE.get().expect("tray state");
+    let selected = state.selected.load(Ordering::Acquire);
+    let mut sources = state.sources.lock().expect("source state");
+    if selected == NO_SELECTION || selected as usize >= sources.len() {
+        return;
+    }
+    sources.remove(selected as usize);
+    let next = if sources.is_empty() {
+        NO_SELECTION
+    } else {
+        (selected as usize).min(sources.len() - 1) as u32
+    };
+    state.selected.store(next, Ordering::Release);
+    drop(sources);
+    let _ = persist_sources();
+    refresh_source_list();
+    refresh_counts();
+    set_message(
+        "Ordner entfernt",
+        "Lokale Dateien und Google-Photos-Medien wurden nicht gel\u{00f6}scht",
+    );
+}
+
+fn open_selected_source(hwnd: HWND) {
+    if let Some(source) = selected_source() {
+        open_path(hwnd, &source.path);
+    }
+}
+
+fn selected_source() -> Option<SourceSpec> {
+    let state = STATE.get()?;
+    let selected = state.selected.load(Ordering::Acquire);
+    state.sources.lock().ok()?.get(selected as usize).cloned()
+}
+
+fn open_path(hwnd: HWND, path: &Path) {
+    if !path.exists() {
+        set_message("Pfad nicht gefunden", &path.to_string_lossy());
+        return;
+    }
+    open_target(hwnd, &path.to_string_lossy());
+}
+
+fn open_target(hwnd: HWND, target: &str) {
+    unsafe {
+        ShellExecuteW(
+            hwnd,
+            wide("open").as_ptr(),
+            wide(target).as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 fn toggle_pause() {
     let state = STATE.get().expect("tray state");
     let paused = !state.paused.fetch_xor(true, Ordering::AcqRel);
-    if let Ok(mut view) = state.view.lock() {
-        view.status = if paused { "Pausiert" } else { "Bereit" }.to_owned();
-        view.detail = if paused {
-            "Automatische Laeufe sind angehalten".to_owned()
+    set_message(
+        if paused {
+            "Automatik pausiert"
         } else {
-            "Naechster Lauf innerhalb von 15 Minuten".to_owned()
-        };
-    }
+            "Automatik fortgesetzt"
+        },
+        if paused {
+            "Manuelle Sicherungen bleiben verf\u{00fc}gbar"
+        } else {
+            "Die n\u{00e4}chste Pr\u{00fc}fung folgt innerhalb von 15 Minuten"
+        },
+    );
     refresh_controls();
-    invalidate();
 }
 
-fn request_sync(manual: bool) {
+fn request_sync(manual: bool, dry_run: bool) {
     let state = STATE.get().expect("tray state").clone();
     if state.paused.load(Ordering::Acquire) && !manual {
         state.next_run.store(unix_seconds() + 60, Ordering::Release);
+        return;
+    }
+    if !state
+        .sources
+        .lock()
+        .expect("source state")
+        .iter()
+        .any(|source| source.enabled)
+    {
+        set_message(
+            "Kein aktiver Ordner",
+            "F\u{00fc}ge einen Ordner hinzu oder aktiviere eine vorhandene Quelle",
+        );
         return;
     }
     if state
@@ -577,35 +993,58 @@ fn request_sync(manual: bool) {
     {
         return;
     }
-    if let Ok(mut view) = state.view.lock() {
-        view.status = "Synchronisiert".to_owned();
-        view.detail = "Hashes pr\u{00fc}fen \u{00b7} Uploads parallel \u{00fc}bertragen".to_owned();
-    }
+    state.dry_run.store(dry_run, Ordering::Release);
+    set_message(
+        if dry_run {
+            "Testlauf l\u{00e4}uft"
+        } else {
+            "Sicherung l\u{00e4}uft"
+        },
+        if dry_run {
+            "Neue Medien werden ermittelt, aber nicht hochgeladen"
+        } else {
+            "Inhalte werden gepr\u{00fc}ft und sicher \u{00fc}bertragen"
+        },
+    );
     refresh_controls();
-    invalidate();
 
     thread::spawn(move || {
+        let sources = state.sources.lock().expect("source state").clone();
+        let mut paths = state.paths.clone();
+        paths.sources = sources.clone();
         let result = match SingleInstance::acquire() {
-            Ok(_instance) => sync(&state.paths, &state.logger, false, None),
+            Ok(_instance) => sync(&paths, &state.logger, dry_run, None),
             Err(error) => Err(error),
         };
-        let refreshed = counts(&state.paths).unwrap_or((0, 0, 0));
+        let refreshed = counts(&paths, &sources).unwrap_or((0, sources.len(), 0));
         if let Ok(mut view) = state.view.lock() {
-            view.screenshots = refreshed.0;
-            view.clips = refreshed.1;
+            view.protected = refreshed.0;
+            view.folders = refreshed.1;
             view.pending = refreshed.2;
-            view.last_run = "Letzter Lauf: gerade eben".to_owned();
+            view.last_run = if dry_run {
+                "Letzter Testlauf: gerade eben"
+            } else {
+                "Letzte Sicherung: gerade eben"
+            }
+            .to_owned();
             match result {
                 Ok(()) => {
-                    view.status = "Aktuell".to_owned();
-                    view.detail = if refreshed.2 == 0 {
-                        "Alles sicher in Google Fotos".to_owned()
+                    view.status = if dry_run {
+                        "Testlauf abgeschlossen"
                     } else {
-                        format!("Noch {} neue Dateien vorgemerkt", refreshed.2)
+                        "Alles aktuell"
+                    }
+                    .to_owned();
+                    view.detail = if dry_run {
+                        format!("{} neue Medien w\u{00fc}rden gesichert", refreshed.2)
+                    } else if refreshed.2 == 0 {
+                        "Alle aktiven Ordner sind auf dem neuesten Stand".to_owned()
+                    } else {
+                        format!("Noch {} neue Medien vorgemerkt", refreshed.2)
                     };
                 }
                 Err(error) => {
-                    view.status = "Pruefen".to_owned();
+                    view.status = "Aktion erforderlich".to_owned();
                     view.detail = error.to_string();
                 }
             }
@@ -614,9 +1053,101 @@ fn request_sync(manual: bool) {
             .next_run
             .store(unix_seconds() + 15 * 60, Ordering::Release);
         state.syncing.store(false, Ordering::Release);
+        state.dry_run.store(false, Ordering::Release);
         refresh_controls();
         invalidate();
     });
+}
+
+fn persist_sources() -> super::AppResult<()> {
+    let state = STATE.get().expect("tray state");
+    let sources = state.sources.lock().expect("source state").clone();
+    let position = *state.window_position.lock().expect("window position");
+    save_sources(&state.paths.config, &sources, position)
+}
+
+fn refresh_source_list() {
+    let Some(state) = STATE.get() else {
+        return;
+    };
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    let sources = state.sources.lock().expect("source state").clone();
+    let selected = state.selected.load(Ordering::Acquire);
+    unsafe {
+        let list = GetDlgItem(hwnd, CMD_SOURCES as i32);
+        SendMessageW(list, LB_RESETCONTENT, 0, 0);
+        for source in &sources {
+            let label = wide(&source.album);
+            SendMessageW(list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM);
+        }
+        if sources.is_empty() {
+            ShowWindow(list, SW_HIDE);
+            state.selected.store(NO_SELECTION, Ordering::Release);
+        } else {
+            ShowWindow(list, SW_SHOW);
+            let selected = (selected as usize).min(sources.len() - 1);
+            state.selected.store(selected as u32, Ordering::Release);
+            SendMessageW(list, LB_SETCURSEL, selected, 0);
+        }
+    }
+    refresh_source_controls();
+    invalidate();
+}
+
+fn update_selection() {
+    let state = STATE.get().expect("tray state");
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    let selected =
+        unsafe { SendMessageW(GetDlgItem(hwnd, CMD_SOURCES as i32), LB_GETCURSEL, 0, 0) };
+    state.selected.store(
+        if selected < 0 {
+            NO_SELECTION
+        } else {
+            selected as u32
+        },
+        Ordering::Release,
+    );
+    refresh_source_controls();
+    invalidate();
+}
+
+fn refresh_source_controls() {
+    let Some(state) = STATE.get() else {
+        return;
+    };
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    let source = selected_source();
+    unsafe {
+        let edit = GetDlgItem(hwnd, CMD_ALBUM as i32);
+        ShowWindow(edit, if source.is_some() { SW_SHOW } else { SW_HIDE });
+        SetWindowTextW(
+            edit,
+            wide(source.as_ref().map_or("", |source| &source.album)).as_ptr(),
+        );
+        EnableWindow(edit, source.is_some().into());
+        for id in [
+            CMD_SAVE_ALBUM,
+            CMD_OPEN_SOURCE,
+            CMD_TOGGLE_SOURCE,
+            CMD_REMOVE_SOURCE,
+        ] {
+            let control = GetDlgItem(hwnd, id as i32);
+            ShowWindow(control, if source.is_some() { SW_SHOW } else { SW_HIDE });
+            EnableWindow(control, source.is_some().into());
+        }
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_TOGGLE_SOURCE as i32),
+            wide(if source.as_ref().is_some_and(|source| source.enabled) {
+                "Pausieren"
+            } else {
+                "Aktivieren"
+            })
+            .as_ptr(),
+        );
+    }
 }
 
 fn refresh_controls() {
@@ -630,42 +1161,94 @@ fn refresh_controls() {
     let syncing = state.syncing.load(Ordering::Acquire);
     let paused = state.paused.load(Ordering::Acquire);
     unsafe {
-        let sync_button = GetDlgItem(hwnd, CMD_SYNC as i32);
-        let pause_button = GetDlgItem(hwnd, CMD_PAUSE as i32);
-        let sync_label = wide(if syncing {
-            "Sicherung l\u{00e4}uft"
-        } else {
-            "Jetzt sichern"
-        });
-        let pause_label = wide(if paused { "Fortsetzen" } else { "Pausieren" });
-        SetWindowTextW(sync_button, sync_label.as_ptr());
-        SetWindowTextW(pause_button, pause_label.as_ptr());
-        EnableWindow(sync_button, (!syncing).into());
-        InvalidateRect(sync_button, null(), 0);
-        InvalidateRect(pause_button, null(), 0);
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SYNC as i32),
+            wide(if syncing {
+                "Sicherung l\u{00e4}uft"
+            } else {
+                "Jetzt sichern"
+            })
+            .as_ptr(),
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_PAUSE as i32),
+            wide(if paused {
+                "Fortsetzen"
+            } else {
+                "Automatik pausieren"
+            })
+            .as_ptr(),
+        );
+        EnableWindow(GetDlgItem(hwnd, CMD_SYNC as i32), (!syncing).into());
+        EnableWindow(GetDlgItem(hwnd, CMD_DRY_RUN as i32), (!syncing).into());
+        InvalidateRect(hwnd, null(), 0);
+    }
+    refresh_source_controls();
+}
+
+fn refresh_counts() {
+    let state = STATE.get().expect("tray state");
+    let sources = state.sources.lock().expect("source state").clone();
+    if let Ok((protected, folders, pending)) = counts(&state.paths, &sources)
+        && let Ok(mut view) = state.view.lock()
+    {
+        view.protected = protected;
+        view.folders = folders;
+        view.pending = pending;
+    }
+    invalidate();
+}
+
+fn counts(paths: &AppPaths, sources: &[SourceSpec]) -> super::AppResult<(i64, usize, usize)> {
+    let connection = open_database(&paths.database)?;
+    let mut protected = 0_i64;
+    let mut pending = 0_usize;
+    for source in sources.iter().filter(|source| source.enabled) {
+        if !source.path.is_dir() {
+            continue;
+        }
+        for path in source_files(&source.path, source.extensions())? {
+            let metadata = fs::metadata(&path)?;
+            let size = i64::try_from(metadata.len())?;
+            let modified = super::modified_ns(&metadata)?;
+            let path_text = path.to_string_lossy();
+            let known = current_record(&connection, &source.album, &path_text, size, modified)?
+                .is_some_and(|(_, _, state)| trusted_state(&state));
+            if known {
+                protected += 1;
+            } else {
+                pending += 1;
+            }
+        }
+    }
+    Ok((protected, sources.len(), pending))
+}
+
+fn set_message(status: &str, detail: &str) {
+    if let Some(state) = STATE.get() {
+        if let Ok(mut view) = state.view.lock() {
+            view.status = status.to_owned();
+            view.detail = detail.to_owned();
+        }
+        invalidate();
     }
 }
 
-fn counts(paths: &AppPaths) -> super::AppResult<(i64, i64, usize)> {
-    let connection = open_database(&paths.database)?;
-    let screenshots: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM media WHERE album = ?1",
-        params!["Screenshots"],
-        |row| row.get(0),
-    )?;
-    let clips: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM media WHERE album = ?1",
-        params!["AMD-Clips"],
-        |row| row.get(0),
-    )?;
-    let mut source_total = 0_usize;
-    for source in &paths.sources {
-        if source.path.is_dir() {
-            source_total += source_files(&source.path, source.extensions())?.len();
-        }
+fn normalized_path(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+}
+
+fn read_control_text(hwnd: HWND) -> String {
+    unsafe {
+        let length = GetWindowTextLengthW(hwnd);
+        let mut buffer = vec![0_u16; length as usize + 1];
+        let read = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+        String::from_utf16_lossy(&buffer[..read.max(0) as usize])
     }
-    let known = usize::try_from(screenshots + clips).unwrap_or_default();
-    Ok((screenshots, clips, source_total.saturating_sub(known)))
 }
 
 fn invalidate() {
@@ -686,10 +1269,40 @@ fn paint_dashboard(hwnd: HWND) {
             &view,
             state.paused.load(Ordering::Acquire),
             state.syncing.load(Ordering::Acquire),
+            state.dry_run.load(Ordering::Acquire),
+            state.selected.load(Ordering::Acquire) != NO_SELECTION,
             state.animation.load(Ordering::Relaxed),
             state.next_run.load(Ordering::Acquire),
         );
     }
+}
+
+const fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+    RECT {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
+
+const fn width(rect: RECT) -> i32 {
+    rect.right - rect.left
+}
+
+const fn height(rect: RECT) -> i32 {
+    rect.bottom - rect.top
+}
+
+fn screen_point(lparam: LPARAM) -> (i32, i32) {
+    (
+        (lparam as u32 & 0xffff) as i16 as i32,
+        ((lparam as u32 >> 16) & 0xffff) as i16 as i32,
+    )
+}
+
+const fn gray(value: u32) -> u32 {
+    value | (value << 8) | (value << 16)
 }
 
 fn wide(value: &str) -> Vec<u16> {

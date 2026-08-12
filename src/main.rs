@@ -37,24 +37,32 @@ const GOOGLE_API: &str = "https://photoslibrary.googleapis.com/v1";
 const GOOGLE_UPLOADS: &str = "https://photoslibrary.googleapis.com/v1/uploads";
 const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
 const TASK_NAME: &str = "Google-Photos-Sync";
+const LEGACY_TASK_NAMES: &[&str] = &["Henrik-Google-Photos-Sync"];
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tif", "tiff", "bmp",
 ];
 const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "mkv", "avi", "webm"];
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "heic", "heif", "tif", "tiff", "bmp", "mp4", "m4v", "mov",
+    "mkv", "avi", "webm",
+];
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceSpec {
     album: String,
     path: PathBuf,
     kind: MediaKind,
+    #[serde(default = "default_true")]
+    enabled: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum MediaKind {
     Images,
     Videos,
+    All,
 }
 
 impl SourceSpec {
@@ -62,13 +70,22 @@ impl SourceSpec {
         match self.kind {
             MediaKind::Images => IMAGE_EXTENSIONS,
             MediaKind::Videos => VIDEO_EXTENSIONS,
+            MediaKind::All => MEDIA_EXTENSIONS,
         }
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+const fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AppConfig {
     sources: Vec<SourceSpec>,
+    #[serde(default)]
+    window_x: Option<i32>,
+    #[serde(default)]
+    window_y: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -301,6 +318,7 @@ struct AppPaths {
     log: PathBuf,
     config: PathBuf,
     sources: Vec<SourceSpec>,
+    window_position: Option<(i32, i32)>,
 }
 
 impl AppPaths {
@@ -323,13 +341,15 @@ impl AppPaths {
             })
             .unwrap_or_else(|| program_data.join("GooglePhotosSync"));
         let config = root.join("gphotos-sync.json");
-        let sources = load_or_create_config(&config)?.sources;
+        let loaded = load_or_create_config(&config)?;
+        let window_position = loaded.window_x.zip(loaded.window_y);
         Ok(Self {
             credentials: root.join("gphotos-rust.credentials"),
             database: root.join("gphotos-rust.db"),
             log: root.join("logs").join("gphotos").join("gphotos-rust.log"),
             config,
-            sources,
+            sources: loaded.sources,
+            window_position,
         })
     }
 }
@@ -353,46 +373,101 @@ fn install(paths: &AppPaths) -> AppResult<()> {
         .arg(action)
         .arg("/F")
         .status()?;
-    if !status.success() {
+    let autostart_name = if status.success() {
+        for legacy_name in LEGACY_TASK_NAMES {
+            remove_task_if_present(legacy_name)?;
+        }
+        TASK_NAME
+    } else if let Some(existing) = LEGACY_TASK_NAMES
+        .iter()
+        .find(|name| task_exists(name).unwrap_or(false))
+    {
+        existing
+    } else {
         return Err("Autostart-Aufgabe konnte nicht erstellt werden.".into());
-    }
+    };
     println!("Installiert: {}", destination.display());
-    println!("Autostart: {TASK_NAME}");
+    println!("Autostart: {autostart_name}");
     Ok(())
 }
 
 fn uninstall() -> AppResult<()> {
-    let status = Command::new("schtasks.exe")
-        .args(["/Delete", "/TN", TASK_NAME, "/F"])
-        .status()?;
-    if !status.success() {
-        return Err("Autostart-Aufgabe konnte nicht entfernt werden.".into());
+    remove_task_if_present(TASK_NAME)?;
+    for legacy_name in LEGACY_TASK_NAMES {
+        remove_task_if_present(legacy_name)?;
     }
     println!("Autostart wurde entfernt. Lokale Daten bleiben erhalten.");
     Ok(())
+}
+
+fn remove_task_if_present(task_name: &str) -> AppResult<bool> {
+    if !task_exists(task_name)? {
+        return Ok(false);
+    }
+    let deleted = Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", task_name, "/F"])
+        .status()?;
+    if !deleted.success() {
+        return Err(format!("Autostart-Aufgabe {task_name} konnte nicht entfernt werden.").into());
+    }
+    Ok(true)
+}
+
+fn task_exists(task_name: &str) -> AppResult<bool> {
+    Ok(Command::new("schtasks.exe")
+        .args(["/Query", "/TN", task_name])
+        .status()?
+        .success())
 }
 
 fn write_example_config(path: &Path) -> AppResult<()> {
     let profile = env::var_os("USERPROFILE")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Users\Public"));
+    let mut sources = Vec::new();
+    let screenshots = profile.join("Pictures").join("Screenshots");
+    if screenshots.is_dir() {
+        sources.push(SourceSpec {
+            album: "Screenshots".to_owned(),
+            path: screenshots,
+            kind: MediaKind::Images,
+            enabled: true,
+        });
+    }
+    let amd_clips = profile.join("Videos").join("Radeon ReLive");
+    if amd_clips.is_dir() {
+        sources.push(SourceSpec {
+            album: "AMD-Clips".to_owned(),
+            path: amd_clips,
+            kind: MediaKind::Videos,
+            enabled: true,
+        });
+    }
     let config = AppConfig {
-        sources: vec![
-            SourceSpec {
-                album: "Screenshots".to_owned(),
-                path: profile.join("Pictures").join("Screenshots"),
-                kind: MediaKind::Images,
-            },
-            SourceSpec {
-                album: "AMD-Clips".to_owned(),
-                path: profile.join("Videos").join("Radeon ReLive"),
-                kind: MediaKind::Videos,
-            },
-        ],
+        sources,
+        window_x: None,
+        window_y: None,
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    fs::write(path, serde_json::to_vec_pretty(&config)?)?;
+    Ok(())
+}
+
+fn save_sources(
+    path: &Path,
+    sources: &[SourceSpec],
+    window_position: Option<(i32, i32)>,
+) -> AppResult<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let config = AppConfig {
+        sources: sources.to_vec(),
+        window_x: window_position.map(|position| position.0),
+        window_y: window_position.map(|position| position.1),
+    };
     fs::write(path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
 }
@@ -787,7 +862,7 @@ impl GoogleClient {
         Err("Google Photos API blieb nach mehreren Versuchen nicht erreichbar.".into())
     }
 
-    fn find_or_create_album(&mut self, title: &str) -> AppResult<String> {
+    fn find_album(&mut self, title: &str) -> AppResult<Option<String>> {
         let mut page_token = String::new();
         loop {
             let mut query = vec![("pageSize".to_owned(), "50".to_owned())];
@@ -803,6 +878,7 @@ impl GoogleClient {
                             .get("id")
                             .and_then(Value::as_str)
                             .map(str::to_owned)
+                            .map(Some)
                             .ok_or_else(|| "Google-Album ohne ID.".into());
                     }
                 }
@@ -813,10 +889,15 @@ impl GoogleClient {
                 .unwrap_or_default()
                 .to_owned();
             if page_token.is_empty() {
-                break;
+                return Ok(None);
             }
         }
+    }
 
+    fn find_or_create_album(&mut self, title: &str) -> AppResult<String> {
+        if let Some(album_id) = self.find_album(title)? {
+            return Ok(album_id);
+        }
         let body = json!({ "album": { "title": title } });
         let value = self.json_request(
             Method::POST,
@@ -976,6 +1057,10 @@ fn sync(
     };
 
     for source in &paths.sources {
+        if !source.enabled {
+            logger.log("INFO", format!("{} ist deaktiviert", source.album));
+            continue;
+        }
         let source_path = source.path.as_path();
         if !source_path.is_dir() {
             logger.log(
@@ -1002,8 +1087,16 @@ fn sync(
         }
         let google = google.as_mut().expect("Google client initialized");
         logger.log("INFO", format!("Pruefe Album {}", source.album));
-        let album_id = google.find_or_create_album(&source.album)?;
-        let remote = google.album_media(&album_id)?;
+        let album_id = if options.dry_run {
+            google.find_album(&source.album)?.unwrap_or_default()
+        } else {
+            google.find_or_create_album(&source.album)?
+        };
+        let remote = if album_id.is_empty() {
+            HashMap::new()
+        } else {
+            google.album_media(&album_id)?
+        };
         logger.log(
             "INFO",
             format!(
@@ -1111,8 +1204,7 @@ fn sync_source(
             upload_name: upload_name.clone(),
         };
 
-        if let Some((known_name, media_id, state)) = record_by_hash(database, &source.album, &hash)?
-        {
+        if let Some((known_name, media_id, state)) = record_by_hash(database, &hash)? {
             upsert_record(
                 database,
                 &source.album,
@@ -1354,6 +1446,7 @@ fn open_database(path: &Path) -> AppResult<Connection> {
              PRIMARY KEY (album, path)
          );
          CREATE INDEX IF NOT EXISTS media_album_hash ON media(album, sha256);
+         CREATE INDEX IF NOT EXISTS media_hash ON media(sha256);
          CREATE TABLE IF NOT EXISTS known_hashes (
              sha256 TEXT PRIMARY KEY,
              source TEXT NOT NULL,
@@ -1415,13 +1508,14 @@ fn current_record(
 
 fn record_by_hash(
     connection: &Connection,
-    album: &str,
     hash: &str,
 ) -> AppResult<Option<(String, String, String)>> {
     Ok(connection
         .query_row(
-            "SELECT upload_name, media_id, state FROM media WHERE album = ?1 AND sha256 = ?2 LIMIT 1",
-            params![album, hash],
+            "SELECT upload_name, media_id, state FROM media
+             WHERE sha256 = ?1 AND state IN ('uploaded', 'remote-existing', 'takeout-existing', 'content-duplicate')
+             ORDER BY CASE WHEN media_id <> '' THEN 0 ELSE 1 END LIMIT 1",
+            params![hash],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?)
@@ -1715,12 +1809,47 @@ mod tests {
                 album: "AMD-Clips".to_owned(),
                 path: PathBuf::from(r"D:\Captures"),
                 kind: MediaKind::Videos,
+                enabled: true,
             }],
+            window_x: Some(100),
+            window_y: Some(200),
         };
         let encoded = serde_json::to_vec(&config).unwrap();
         let decoded: AppConfig = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.sources[0].album, "AMD-Clips");
         assert_eq!(decoded.sources[0].path, PathBuf::from(r"D:\Captures"));
         assert!(matches!(decoded.sources[0].kind, MediaKind::Videos));
+        assert!(decoded.sources[0].enabled);
+        assert_eq!((decoded.window_x, decoded.window_y), (Some(100), Some(200)));
+    }
+
+    #[test]
+    fn old_config_defaults_sources_to_enabled() {
+        let decoded: AppConfig = serde_json::from_str(
+            r#"{"sources":[{"album":"Fotos","path":"D:\\Fotos","kind":"images"}]}"#,
+        )
+        .unwrap();
+        assert!(decoded.sources[0].enabled);
+        assert_eq!((decoded.window_x, decoded.window_y), (None, None));
+    }
+
+    #[test]
+    fn hashes_are_reused_across_albums() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE media (
+                    album TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL, sha256 TEXT NOT NULL, upload_name TEXT NOT NULL,
+                    media_id TEXT NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL
+                );
+                INSERT INTO media VALUES
+                    ('Erstes Album', 'D:\\Foto.jpg', 4, 1, 'same-hash', 'photo-hash.jpg',
+                     'media-1', 'uploaded', 1);",
+            )
+            .unwrap();
+        let known = record_by_hash(&connection, "same-hash").unwrap().unwrap();
+        assert_eq!(known.0, "photo-hash.jpg");
+        assert_eq!(known.1, "media-1");
     }
 }

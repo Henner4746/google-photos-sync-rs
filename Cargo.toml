@@ -1,6 +1,6 @@
 [package]
 name = "gphotos-sync"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 rust-version = "1.91"
 description = "Native Windows tray backup for Google Photos with content-aware deduplication"
@@ -21,10 +21,12 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security_Cryptography",
+    "Win32_System_Com",
     "Win32_System_LibraryLoader",
     "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
