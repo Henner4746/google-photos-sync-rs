@@ -34,7 +34,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 
 Download `Google-Photos-Sync-Setup.exe` from the [latest release](https://github.com/Henner4746/google-photos-sync-rs/releases/latest), run it, and follow the first-run assistant. The installer is per-user, adds a clean Windows autostart entry when selected, and provides a normal uninstaller.
 
-Official releases are signing-ready. A trusted Windows signature is present only when the release workflow has access to the project's code-signing certificate; otherwise Windows may show a SmartScreen warning.
+Public v2 releases are created only after the release workflow has verified a trusted Windows signature. The workflow supports either a project certificate or the managed open-source signing path described in the [code signing policy](CODE_SIGNING_POLICY.md); it refuses to publish unsigned artifacts.
 
 For development builds without an embedded production OAuth client, the assistant opens a file picker for a Google **Desktop app** OAuth JSON. Public releases embed that JSON at build time through a protected repository secret; it is never committed.
 
@@ -75,6 +75,10 @@ flowchart LR
 Configuration, SQLite index, logs, and protected credentials live under `%LOCALAPPDATA%\GooglePhotosSync` for new installations. OAuth refresh tokens are encrypted with Windows DPAPI for the current Windows account. Backups containing the credential file remain bound to that account and PC context.
 
 The app has no own backend, analytics, advertising, or telemetry. See the full [privacy statement](https://henner4746.github.io/google-photos-sync-rs/privacy.html).
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/). Maintainer roles, release approval, privacy guarantees, and verification instructions are documented in the [code signing policy](CODE_SIGNING_POLICY.md).
 
 ## Advanced commands
 

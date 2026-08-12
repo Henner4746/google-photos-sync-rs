@@ -3,12 +3,20 @@ name = "gphotos-sync"
 version = "2.0.0"
 edition = "2024"
 rust-version = "1.91"
+build = "build.rs"
 description = "Native Windows tray backup for Google Photos with content-aware deduplication"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Henner4746/google-photos-sync-rs"
 keywords = ["google-photos", "backup", "windows", "deduplication", "tray"]
 categories = ["command-line-utilities", "filesystem"]
+
+[package.metadata.winresource]
+ProductName = "Google Photos Sync"
+FileDescription = "Native Google Photos folder backup"
+CompanyName = "Google Photos Sync Contributors"
+OriginalFilename = "gphotos-sync.exe"
+LegalCopyright = "Copyright (c) 2026 Google Photos Sync Contributors"
 
 [dependencies]
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "form", "json", "native-tls", "query"] }
@@ -32,6 +40,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+winresource = "0.1.31"
 
 [profile.release]
 opt-level = "z"

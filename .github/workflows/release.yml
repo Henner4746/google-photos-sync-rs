@@ -5,6 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
+  actions: read
   contents: write
 
 jobs:
@@ -14,24 +15,52 @@ jobs:
       GPHOTOS_SYNC_OAUTH_CLIENT_JSON: ${{ secrets.GPHOTOS_SYNC_OAUTH_CLIENT_JSON }}
       WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+      SIGNPATH_ORGANIZATION_ID: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+      SIGNPATH_PROJECT_SLUG: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+      SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+      SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Require production OAuth and signing secrets
+      - uses: actions/checkout@v5
+      - name: Validate release identity and choose signing provider
+        id: signing_context
         shell: pwsh
         run: |
-          $missing = @()
-          if ([string]::IsNullOrWhiteSpace($env:GPHOTOS_SYNC_OAUTH_CLIENT_JSON)) { $missing += 'GPHOTOS_SYNC_OAUTH_CLIENT_JSON' }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64)) { $missing += 'WINDOWS_CERTIFICATE_BASE64' }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) { $missing += 'WINDOWS_CERTIFICATE_PASSWORD' }
-          if ($missing.Count -gt 0) {
-            throw "Release blocked: configure $($missing -join ', ') before publishing."
+          if ([string]::IsNullOrWhiteSpace($env:GPHOTOS_SYNC_OAUTH_CLIENT_JSON)) {
+            throw 'Release blocked: configure GPHOTOS_SYNC_OAUTH_CLIENT_JSON.'
           }
+
+          $pfxReady = ![string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64) -and
+            ![string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
+          $signPathValues = @(
+            $env:SIGNPATH_API_TOKEN,
+            $env:SIGNPATH_ORGANIZATION_ID,
+            $env:SIGNPATH_PROJECT_SLUG,
+            $env:SIGNPATH_SIGNING_POLICY_SLUG,
+            $env:SIGNPATH_ARTIFACT_CONFIGURATION_SLUG
+          )
+          $signPathReady = @($signPathValues | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -eq 0
+          if (!$pfxReady -and !$signPathReady) {
+            throw 'Release blocked: configure either the PFX secrets or the five SIGNPATH_* secrets.'
+          }
+
+          $version = $env:GITHUB_REF_NAME -replace '^v', ''
+          $cargoVersion = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $installerVersion = [regex]::Match((Get-Content installer\gphotos-sync.iss -Raw), '#define MyAppVersion\s+"([^"]+)"').Groups[1].Value
+          if ($version -ne $cargoVersion -or $version -ne $installerVersion) {
+            throw "Tag $version, Cargo $cargoVersion, and installer $installerVersion must match."
+          }
+
+          $provider = if ($signPathReady) { 'signpath' } else { 'pfx' }
+          "provider=$provider" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Sign application
+      - name: Sign application with project certificate
+        if: steps.signing_context.outputs.provider == 'pfx'
         shell: pwsh
         run: |
           [IO.File]::WriteAllBytes("$env:RUNNER_TEMP\codesign.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
@@ -39,6 +68,43 @@ jobs:
             Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f "$env:RUNNER_TEMP\codesign.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD target\release\gphotos-sync.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload unsigned application for SignPath
+        if: steps.signing_context.outputs.provider == 'signpath'
+        id: upload_unsigned_app
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-app-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/release/gphotos-sync.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+      - name: Sign application with SignPath
+        if: steps.signing_context.outputs.provider == 'signpath'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload_unsigned_app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: target/release/signpath-app
+          parameters: |
+            version: ${{ toJSON(steps.signing_context.outputs.version) }}
+      - name: Install SignPath-signed application
+        if: steps.signing_context.outputs.provider == 'signpath'
+        shell: pwsh
+        run: |
+          $signed = Get-ChildItem target\release\signpath-app -Recurse -Filter gphotos-sync.exe | Select-Object -First 1
+          if (!$signed) { throw 'SignPath did not return gphotos-sync.exe.' }
+          Copy-Item -Force $signed.FullName target\release\gphotos-sync.exe
+      - name: Verify application signature
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName verify /pa /v target\release\gphotos-sync.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build installer
@@ -47,13 +113,51 @@ jobs:
           choco install innosetup --no-progress -y
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\gphotos-sync.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Sign installer
+      - name: Sign installer with project certificate
+        if: steps.signing_context.outputs.provider == 'pfx'
         shell: pwsh
         run: |
           $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
             Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f "$env:RUNNER_TEMP\codesign.pfx" /p $env:WINDOWS_CERTIFICATE_PASSWORD dist\Google-Photos-Sync-Setup.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload unsigned installer for SignPath
+        if: steps.signing_context.outputs.provider == 'signpath'
+        id: upload_unsigned_installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-installer-${{ github.run_id }}-${{ github.run_attempt }}
+          path: dist/Google-Photos-Sync-Setup.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+      - name: Sign installer with SignPath
+        if: steps.signing_context.outputs.provider == 'signpath'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload_unsigned_installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: dist/signpath-installer
+          parameters: |
+            version: ${{ toJSON(steps.signing_context.outputs.version) }}
+      - name: Install SignPath-signed installer
+        if: steps.signing_context.outputs.provider == 'signpath'
+        shell: pwsh
+        run: |
+          $signed = Get-ChildItem dist\signpath-installer -Recurse -Filter Google-Photos-Sync-Setup.exe | Select-Object -First 1
+          if (!$signed) { throw 'SignPath did not return Google-Photos-Sync-Setup.exe.' }
+          Copy-Item -Force $signed.FullName dist\Google-Photos-Sync-Setup.exe
+      - name: Verify installer signature
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName verify /pa /v dist\Google-Photos-Sync-Setup.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Create checksums
@@ -68,6 +172,8 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: |
+            Code signing policy: https://henner4746.github.io/google-photos-sync-rs/code-signing.html
           files: |
             target/release/gphotos-sync.exe
             dist/Google-Photos-Sync-Setup.exe

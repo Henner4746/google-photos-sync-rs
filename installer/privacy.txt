@@ -1,0 +1,10 @@
+DATENSCHUTZ UND SYSTEMÄNDERUNGEN
+
+Google Photos Sync arbeitet lokal auf diesem Windows-PC. Die App besitzt keinen eigenen Server, keine Werbung und keine Telemetrie.
+
+Nur ausdrücklich ausgewählte Bild- und Videodateien werden direkt an die Google Photos Library API übertragen. Lokale Dateiinformationen, Inhaltsprüfsummen, Einstellungen und Protokolle bleiben auf diesem PC. Google-Zugangsdaten werden mit Windows DPAPI für das aktuelle Windows-Konto verschlüsselt.
+
+Die Installation legt die App im lokalen Benutzerprofil ab und richtet den angezeigten Autostart-Eintrag „Google Photos Sync“ ein. Autostart kann im Einrichtungsassistenten oder später in den Einstellungen ausgeschaltet werden. Die normale Windows-Deinstallation entfernt App und Autostart; lokale Nutzerdaten bleiben zur Sicherheit erhalten, bis sie bewusst gelöscht werden.
+
+Vollständige Datenschutzerklärung:
+https://henner4746.github.io/google-photos-sync-rs/privacy.html
