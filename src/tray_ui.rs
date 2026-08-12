@@ -129,6 +129,14 @@ unsafe fn settings_page(dc: HDC, view: &ViewState, autostart: bool, fonts: &Font
         );
         text(
             dc,
+            "Google-Zugriff und Aktualisierungen",
+            rect(40, 494, 680, 518),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
             &view.detail,
             rect(40, 590, 680, 628),
             TEXT_MUTED,
@@ -243,26 +251,42 @@ unsafe fn setup_page(
         rounded_fill(dc, rect(40, 116, 680, 218), 16, SURFACE_CONTAINER);
         text(
             dc,
-            "Wichtig zu vorhandenen Google-Fotos",
-            rect(60, 132, 660, 160),
+            "Google-Zugriff vor dem Verbinden",
+            rect(60, 126, 660, 152),
             TEXT_PRIMARY,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER,
             fonts.heading,
         );
         text(
             dc,
-            "Seit März 2025 sieht die Google-API nur Medien, die diese App selbst hochgeladen hat.",
-            rect(60, 162, 660, 186),
+            "Neue Medien aus gewählten Ordnern gehen direkt an dein Google-Fotos-Konto.",
+            rect(60, 152, 660, 174),
             TEXT_SECONDARY,
             DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
-            fonts.body,
+            fonts.label,
         );
         text(
             dc,
-            "Ein Takeout-Import verhindert Duplikate mit bereits vorhandenen Bildern und Videos.",
-            rect(60, 186, 660, 208),
+            "Seit März 2025 liest die App nur selbst hochgeladene Inhalte; andere bleiben unsichtbar.",
+            rect(60, 174, 660, 196),
             TEXT_MUTED,
             DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            "Zugang nur Windows-verschlüsselt auf diesem PC · kein eigener Server.",
+            rect(60, 196, 660, 216),
+            TEXT_MUTED,
+            DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,
+            fonts.label,
+        );
+        text(
+            dc,
+            "Mit dem nächsten Klick stimmst du genau diesem Zugriff zu.",
+            rect(40, 218, 680, 240),
+            TEXT_SECONDARY,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
             fonts.label,
         );
         for (top, done) in [
@@ -292,7 +316,7 @@ unsafe fn setup_page(
         );
         text(
             dc,
-            "Die ausgewählten Ordner bleiben auf diesem PC. Hochgeladen werden nur neue Inhalte.",
+            "Takeout wird nur lokal gelesen. Hochgeladen werden ausschließlich neue Inhalte.",
             rect(40, 590, 680, 628),
             TEXT_MUTED,
             DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,

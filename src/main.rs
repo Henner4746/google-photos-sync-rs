@@ -4,8 +4,8 @@
 #[cfg(not(windows))]
 compile_error!("gphotos-sync is intentionally Windows-only because credentials use DPAPI.");
 
-use reqwest::Method;
 use reqwest::blocking::{Client, Response};
+use reqwest::{Method, StatusCode};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -36,6 +36,7 @@ type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 const GOOGLE_API: &str = "https://photoslibrary.googleapis.com/v1";
 const GOOGLE_UPLOADS: &str = "https://photoslibrary.googleapis.com/v1/uploads";
 const GOOGLE_TOKEN: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_REVOKE: &str = "https://oauth2.googleapis.com/revoke";
 const AUTOSTART_NAME: &str = "Google Photos Sync";
 const DEFAULT_SCHEDULE_MINUTES: u32 = 15;
 const MIN_SCHEDULE_MINUTES: u32 = 5;
@@ -637,6 +638,32 @@ fn protect_credentials(paths: &AppPaths, input: &Path) -> AppResult<()> {
         paths.credentials.display()
     );
     Ok(())
+}
+
+fn disconnect_google(paths: &AppPaths) -> AppResult<()> {
+    if !paths.credentials.is_file() {
+        return Ok(());
+    }
+    let credentials = load_credentials(&paths.credentials)?;
+    let response = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?
+        .post(GOOGLE_REVOKE)
+        .form(&[("token", credentials.refresh_token.as_str())])
+        .send()?;
+    if !revocation_allows_local_deletion(response.status()) {
+        return Err(format!(
+            "Google-Zugriff konnte nicht widerrufen werden (HTTP {}).",
+            response.status()
+        )
+        .into());
+    }
+    fs::remove_file(&paths.credentials)?;
+    Ok(())
+}
+
+fn revocation_allows_local_deletion(status: StatusCode) -> bool {
+    status.is_success() || status == StatusCode::BAD_REQUEST
 }
 
 fn default_auth_uri() -> String {
@@ -2221,5 +2248,14 @@ mod tests {
         progress.finish_streamed_file();
         assert_eq!(progress.files_done.load(Ordering::Acquire), 1);
         assert_eq!(progress.bytes_done.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn revoked_or_already_invalid_tokens_can_be_deleted_locally() {
+        assert!(revocation_allows_local_deletion(StatusCode::OK));
+        assert!(revocation_allows_local_deletion(StatusCode::BAD_REQUEST));
+        assert!(!revocation_allows_local_deletion(
+            StatusCode::INTERNAL_SERVER_ERROR
+        ));
     }
 }

@@ -2,9 +2,10 @@
 
 use super::{
     AppPaths, DEFAULT_SCHEDULE_MINUTES, Logger, MediaKind, OperationProgress, SingleInstance,
-    SourceSpec, authorize, authorize_json, current_record, embedded_oauth_client, hex_encode,
-    import_takeout, open_database, save_config, set_autostart_executable, source_files,
-    source_files_for_source, sync, trusted_state, unix_seconds,
+    SourceSpec, authorize, authorize_json, current_record, disconnect_google,
+    embedded_oauth_client, hex_encode, import_takeout, open_database, save_config,
+    set_autostart_executable, source_files, source_files_for_source, sync, trusted_state,
+    unix_seconds,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -44,18 +45,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateIconIndirect, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, GetCursorPos,
     GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    HMENU, HTCAPTION, HTCLIENT, HWND_TOP, ICONINFO, IDC_ARROW, IDC_HAND, IsDialogMessageW,
+    HMENU, HTCAPTION, HTCLIENT, HWND_TOP, ICONINFO, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW,
     KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
     LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
-    LBS_OWNERDRAWFIXED, LoadCursorW, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_SHOWWINDOW, SendMessageW,
-    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, SetWindowTextW, ShowWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX, WM_DESTROY, WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND,
-    WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS,
-    WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_CONTROLPARENT, WS_POPUP, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    LBS_OWNERDRAWFIXED, LoadCursorW, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MF_SEPARATOR,
+    MF_STRING, MSG, MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
+    SW_SHOW, SW_SHOWNORMAL, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND, WM_CTLCOLOREDIT, WM_CTLCOLORLISTBOX,
+    WM_DESTROY, WM_DRAWITEM, WM_ENABLE, WM_ERASEBKGND, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETFONT, WM_TIMER, WNDCLASSW, WS_CHILD,
+    WS_EX_CONTROLPARENT, WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 #[path = "tray_ui.rs"]
@@ -93,10 +94,12 @@ const CMD_BACKUP: usize = 1023;
 const CMD_RESTORE: usize = 1024;
 const CMD_SETTINGS: usize = 1025;
 const CMD_UPDATE: usize = 1026;
+const CMD_DISCONNECT_GOOGLE: usize = 1027;
 const WM_WORK_FINISHED: u32 = WM_APP + 2;
 const WORK_GOOGLE: usize = 1;
 const WORK_TAKEOUT: usize = 2;
 const WORK_UPDATE: usize = 3;
+const WORK_DISCONNECT: usize = 4;
 
 const WINDOW_WIDTH: i32 = 720;
 const WINDOW_HEIGHT: i32 = 656;
@@ -125,7 +128,8 @@ const SETTINGS_SCHEDULE: RECT = rect(40, 168, 680, 216);
 const SETTINGS_EXCLUDE: RECT = rect(40, 232, 680, 280);
 const SETTINGS_BACKUP: RECT = rect(40, 328, 350, 376);
 const SETTINGS_RESTORE: RECT = rect(370, 328, 680, 376);
-const SETTINGS_UPDATE: RECT = rect(40, 526, 680, 578);
+const SETTINGS_UPDATE: RECT = rect(40, 526, 350, 578);
+const SETTINGS_DISCONNECT: RECT = rect(370, 526, 680, 578);
 
 static STATE: OnceLock<Arc<TrayState>> = OnceLock::new();
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
@@ -366,6 +370,7 @@ unsafe fn create_controls(hwnd: HWND, instance: HINSTANCE) -> super::AppResult<(
         (CMD_BACKUP, "Daten sichern", SETTINGS_BACKUP),
         (CMD_RESTORE, "Daten wiederherstellen", SETTINGS_RESTORE),
         (CMD_UPDATE, "Nach Aktualisierung suchen", SETTINGS_UPDATE),
+        (CMD_DISCONNECT_GOOGLE, "Google trennen", SETTINGS_DISCONNECT),
     ];
     for (id, label, rect) in buttons {
         let style = WS_CHILD
@@ -743,6 +748,8 @@ fn create_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
                 let back = (5..=12).contains(&x) && (19..=26).contains(&y) && x + y <= 31;
                 pixels[(y * 32 + x) as usize] = if ring || forward || back {
                     0xff_f2_f2_f2
+                } else if distance <= 225 {
+                    0xff_11_11_11
                 } else {
                     0
                 };
@@ -903,6 +910,7 @@ fn handle_command(hwnd: HWND, command: usize) {
         CMD_BACKUP => backup_database(hwnd),
         CMD_RESTORE => restore_database(hwnd),
         CMD_UPDATE => request_update(),
+        CMD_DISCONNECT_GOOGLE => disconnect_google_account(hwnd),
         CMD_OPEN_LOG => open_path(hwnd, &STATE.get().expect("tray state").paths.log),
         CMD_OPEN_PHOTOS => open_target(hwnd, "https://photos.google.com/"),
         CMD_EXIT => unsafe {
@@ -967,6 +975,7 @@ fn refresh_mode_controls() {
             CMD_BACKUP,
             CMD_RESTORE,
             CMD_UPDATE,
+            CMD_DISCONNECT_GOOGLE,
         ] {
             ShowWindow(
                 GetDlgItem(hwnd, id as i32),
@@ -986,7 +995,7 @@ fn refresh_mode_controls() {
             wide(if state.paths.credentials.is_file() {
                 "Google verbunden"
             } else {
-                "Mit Google verbinden"
+                "Verstanden · Mit Google verbinden"
             })
             .as_ptr(),
         );
@@ -1159,6 +1168,41 @@ fn finish_setup() {
     set_message("Bereit", "Nur neue Inhalte werden hochgeladen");
 }
 
+fn disconnect_google_account(hwnd: HWND) {
+    let choice = unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(
+                "Der Google-Zugriff wird widerrufen und der lokal verschlüsselte Zugang gelöscht. Deine Fotos bleiben unverändert.",
+            )
+            .as_ptr(),
+            wide("Google wirklich trennen?").as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    if choice != IDYES {
+        return;
+    }
+    let state = STATE.get().expect("tray state").clone();
+    if state.working.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    set_message("Google wird getrennt", "Der Zugriff wird sicher widerrufen");
+    thread::spawn(move || {
+        let result = disconnect_google(&state.paths);
+        *state.pending_error.lock().expect("background result") =
+            result.err().map(|error| error.to_string());
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+                state.hwnd.load(Ordering::Acquire) as HWND,
+                WM_WORK_FINISHED,
+                WORK_DISCONNECT,
+                0,
+            )
+        };
+    });
+}
+
 fn finish_background_work(kind: usize) {
     let state = STATE.get().expect("tray state");
     state.working.store(false, Ordering::Release);
@@ -1191,6 +1235,15 @@ fn finish_background_work(kind: usize) {
             return;
         }
         set_message("Alles aktuell", "Du verwendest bereits die neueste Version");
+    } else if kind == WORK_DISCONNECT {
+        state.onboarding_completed.store(false, Ordering::Release);
+        state.settings_mode.store(false, Ordering::Release);
+        state.setup_mode.store(true, Ordering::Release);
+        let _ = persist_sources();
+        set_message(
+            "Google getrennt",
+            "Fotos und lokale Duplikatdaten bleiben unverändert",
+        );
     }
     refresh_mode_controls();
     refresh_counts();

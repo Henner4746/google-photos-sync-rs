@@ -19,6 +19,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 ## What it does
 
 - **First-run assistant.** Google sign-in, folder selection, the Google Photos limitation, optional Takeout import, and autostart are handled in the UI.
+- **Explicit Google consent.** Immediately before sign-in, the app explains exactly what is uploaded, what it can read, where credentials stay, and that no own server is involved.
 - **Content-based duplicate protection.** SHA-256 identifies media independently of filename, path, source, or album. A known image or AMD clip is not uploaded again.
 - **Google-side recovery.** Content-addressed filenames reconcile media that this same app can see in Google Photos.
 - **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose.
@@ -27,6 +28,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 - **Network recovery.** Upload and API calls retry transient failures with backoff. Anything not confirmed remains pending and resumes on the next run.
 - **Persistent state.** Paused state, schedules, window position, and last successful runs survive restarts.
 - **Local backup and restore.** Settings, the duplicate database, and DPAPI-protected credentials can be backed up from the app.
+- **Revocable access.** `Google trennen` revokes the Google token and removes the local encrypted credential without deleting photos.
 - **Verified updates.** The updater accepts only GitHub release assets whose SHA-256 digest matches the release metadata.
 - **Low overhead.** Native Win32 UI, SQLite, four upload streams, and small optimized Rust release builds.
 
@@ -74,7 +76,7 @@ flowchart LR
 
 Configuration, SQLite index, logs, and protected credentials live under `%LOCALAPPDATA%\GooglePhotosSync` for new installations. OAuth refresh tokens are encrypted with Windows DPAPI for the current Windows account. Backups containing the credential file remain bound to that account and PC context.
 
-The app has no own backend, analytics, advertising, or telemetry. See the full [privacy statement](https://henner4746.github.io/google-photos-sync-rs/privacy.html).
+The app has no own backend, analytics, advertising, or telemetry. See the [privacy statement](https://henner4746.github.io/google-photos-sync-rs/privacy.html), [terms](https://henner4746.github.io/google-photos-sync-rs/terms.html), and [data-management instructions](https://henner4746.github.io/google-photos-sync-rs/data-management.html).
 
 ## Code signing policy
 
@@ -105,7 +107,7 @@ cargo test
 cargo build --release
 ```
 
-To embed the public Desktop OAuth configuration for a release build, set `GPHOTOS_SYNC_OAUTH_CLIENT_JSON` only in the protected build environment. See [the OAuth release checklist](docs/OAUTH_RELEASE_CHECKLIST.md).
+To embed the public Desktop OAuth configuration for a release build, set `GPHOTOS_SYNC_OAUTH_CLIENT_JSON` only in the protected build environment. See [the OAuth release checklist](docs/OAUTH_RELEASE_CHECKLIST.md) and [verification handoff](docs/GOOGLE_OAUTH_VERIFICATION.md).
 
 ## License
 
