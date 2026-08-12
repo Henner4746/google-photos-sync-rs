@@ -2,6 +2,8 @@
 
 Official Windows releases of Google Photos Sync are built from the public source repository by GitHub Actions. Release artifacts are accepted only after their Authenticode signatures and SHA-256 checksums have been verified by the release workflow.
 
+The in-app updater independently repeats these checks on the user's PC. It accepts an executable only when the GitHub release digest matches, Windows trusts its Authenticode chain, and its publisher matches the currently installed executable. The helper verifies both signatures and the publisher again immediately before replacing the running app.
+
 Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
 
 ## Team roles

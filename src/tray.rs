@@ -1508,6 +1508,10 @@ fn download_update(paths: &AppPaths) -> super::AppResult<bool> {
     let helper = update_dir.join(format!("gphotos-sync-{latest}.exe"));
     fs::write(&helper, &bytes)?;
     let target = std::env::current_exe()?;
+    if let Err(error) = super::security::verify_update_candidate(&target, &helper) {
+        let _ = fs::remove_file(&helper);
+        return Err(error);
+    }
     std::process::Command::new(helper)
         .arg("apply-update")
         .arg(target)

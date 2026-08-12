@@ -29,7 +29,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 - **Persistent state.** Paused state, schedules, window position, and last successful runs survive restarts.
 - **Local backup and restore.** Settings, the duplicate database, and DPAPI-protected credentials can be backed up from the app.
 - **Revocable access.** `Google trennen` revokes the Google token and removes the local encrypted credential without deleting photos.
-- **Verified updates.** The updater accepts only GitHub release assets whose SHA-256 digest matches the release metadata.
+- **Verified updates.** The updater requires the GitHub SHA-256 digest, a trusted Windows Authenticode signature, and the same publisher as the installed app. It verifies the signature again immediately before replacement.
 - **Low overhead.** Native Win32 UI, SQLite, four upload streams, and small optimized Rust release builds.
 
 ## Install

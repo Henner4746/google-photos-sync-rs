@@ -29,6 +29,7 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 
+mod security;
 mod tray;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -778,6 +779,9 @@ fn apply_downloaded_update(target: &Path, previous_pid: u32) -> AppResult<()> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
 
+    let source = env::current_exe()?;
+    security::verify_update_candidate(target, &source)?;
+
     unsafe {
         let process = OpenProcess(0x0010_0000, 0, previous_pid);
         if !process.is_null() {
@@ -785,11 +789,11 @@ fn apply_downloaded_update(target: &Path, previous_pid: u32) -> AppResult<()> {
             CloseHandle(process);
         }
     }
-    let source = env::current_exe()?;
     let mut last_error = None;
     for _ in 0..20 {
         match fs::copy(&source, target) {
             Ok(_) => {
+                security::verify_update_candidate(&source, target)?;
                 Command::new(target).arg("tray").spawn()?;
                 return Ok(());
             }
