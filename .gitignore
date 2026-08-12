@@ -1,0 +1,11 @@
+/target/
+*.credentials
+*.db
+*.db-shm
+*.db-wal
+*.log
+credentials.json
+.env
+.idea/
+.vscode/
+/docs/*.png
