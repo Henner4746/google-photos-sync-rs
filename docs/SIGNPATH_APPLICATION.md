@@ -24,7 +24,7 @@ Artifacts to sign:
 - `gphotos-sync.exe`
 - `Google-Photos-Sync-Setup.exe`
 
-The app and installer now contain matching `2.0.0` product/version metadata. The workflow submits each unsigned PE artifact directly from the GitHub-hosted build, waits for manual approval, installs the returned signed artifact, verifies it with `signtool verify /pa`, creates SHA-256 checksums, and only then publishes the release.
+The app and installer now contain matching `2.0.0` product/version metadata. Configure the artifact configuration for a direct PE file so it accepts both filenames below. The workflow uploads each file with `archive: false` and therefore submits it with `skip-decompress: true`, waits for manual approval, installs the returned signed artifact, verifies it with `signtool verify /pa`, confirms both files use the same certificate, creates SHA-256 checksums, and only then publishes the release.
 
 ## Post-approval values
 

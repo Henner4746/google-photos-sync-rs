@@ -22,6 +22,34 @@ jobs:
       SIGNPATH_ARTIFACT_CONFIGURATION_SLUG: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Require a release commit from main
+        shell: pwsh
+        run: |
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Release blocked: the tagged commit is not part of main.'
+          }
+      - name: Reject personal workstation traces
+        shell: pwsh
+        run: |
+          $forbidden = @(
+            ('C:\Users\' + 'Henrik\'),
+            ('E:\' + 'Screenshots'),
+            ('Henrik-' + 'Google-Photos-Sync')
+          )
+          foreach ($needle in $forbidden) {
+            $matches = git grep -n -I -F -- $needle
+            $grepExitCode = $LASTEXITCODE
+            if ($grepExitCode -eq 0) {
+              throw "Personal workstation trace found: $needle`n$matches"
+            }
+            if ($grepExitCode -ne 1) {
+              throw "Repository trace scan failed for: $needle"
+            }
+          }
+          exit 0
       - name: Validate release identity and choose signing provider
         id: signing_context
         shell: pwsh
@@ -75,7 +103,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
       - run: cargo build --release
       - name: Sign application with project certificate
         if: steps.signing_context.outputs.provider == 'pfx'
@@ -106,6 +138,7 @@ jobs:
           signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
           artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
           github-artifact-id: ${{ steps.upload_unsigned_app.outputs.artifact-id }}
+          skip-decompress: true
           wait-for-completion: true
           wait-for-completion-timeout-in-seconds: 3600
           output-artifact-directory: target/release/signpath-app
@@ -159,6 +192,7 @@ jobs:
           signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
           artifact-configuration-slug: ${{ secrets.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
           github-artifact-id: ${{ steps.upload_unsigned_installer.outputs.artifact-id }}
+          skip-decompress: true
           wait-for-completion: true
           wait-for-completion-timeout-in-seconds: 3600
           output-artifact-directory: dist/signpath-installer
