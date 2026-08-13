@@ -33,7 +33,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 - **Verified updates.** The updater checks at startup and then daily. No stable release is treated as a normal no-update result. An available update requires the GitHub SHA-256 digest, a trusted Windows Authenticode signature, and the same publisher as the installed app, and is verified again immediately before replacement.
 - **Low overhead.** Native Win32 UI, SQLite, four upload streams, and small optimized Rust release builds. The hidden tray app has no permanent animation timer, scans folders lazily at autostart, and repaints only while its window is visible.
 
-The current optimized release executable is about 2.12 MiB. A repeatable 30-second hidden-tray measurement and the safeguards behind it are documented in [Performance](docs/PERFORMANCE.md).
+The current optimized release executable is about 2.13 MiB. A repeatable 30-second hidden-tray measurement and the safeguards behind it are documented in [Performance](docs/PERFORMANCE.md).
 
 ## Install
 

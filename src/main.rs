@@ -357,6 +357,12 @@ fn real_main() -> AppResult<()> {
         }
         "install" => install(&paths),
         "uninstall" => uninstall(),
+        "update-worker" => {
+            let result = args
+                .get(1)
+                .ok_or("Ergebnisdatei f\u{00fc}r die Aktualisierungspr\u{00fc}fung fehlt.")?;
+            tray::run_update_worker(&paths, Path::new(result))
+        }
         "apply-update" => {
             let target = args.get(1).ok_or("Ziel der Aktualisierung fehlt.")?;
             let pid = args

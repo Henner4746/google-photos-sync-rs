@@ -7,6 +7,7 @@ use super::{
     save_config, set_autostart_executable, source_files, source_files_for_source, sync,
     trusted_state, unix_seconds,
 };
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fs;
@@ -180,9 +181,15 @@ struct TrayState {
     setup_mode: AtomicBool,
     working: AtomicBool,
     pending_error: Mutex<Option<String>>,
+    pending_update: Mutex<Option<PathBuf>>,
     settings_mode: AtomicBool,
-    update_ready: AtomicBool,
     counts_loaded: AtomicBool,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct UpdateWorkerResult {
+    helper: Option<PathBuf>,
+    error: Option<String>,
 }
 
 pub(super) fn run(
@@ -243,8 +250,8 @@ pub(super) fn run(
         setup_mode: AtomicBool::new(initial_setup_mode),
         working: AtomicBool::new(false),
         pending_error: Mutex::new(None),
+        pending_update: Mutex::new(None),
         settings_mode: AtomicBool::new(false),
-        update_ready: AtomicBool::new(false),
         counts_loaded: AtomicBool::new(load_initial_counts),
     });
     STATE
@@ -1323,7 +1330,24 @@ fn finish_background_work(kind: usize) {
             "Vorhandene Inhalte werden nicht erneut hochgeladen",
         );
     } else if kind == WORK_UPDATE {
-        if state.update_ready.load(Ordering::Acquire) {
+        if let Some(helper) = state.pending_update.lock().expect("prepared update").take() {
+            let launch = (|| -> super::AppResult<()> {
+                let target = std::env::current_exe()?;
+                super::security::verify_update_candidate(&target, &helper)?;
+                std::process::Command::new(&helper)
+                    .arg("apply-update")
+                    .arg(target)
+                    .arg(std::process::id().to_string())
+                    .spawn()?;
+                Ok(())
+            })();
+            if let Err(error) = launch {
+                let _ = fs::remove_file(&helper);
+                let detail = error.to_string();
+                set_message("Aktualisierung blockiert", &detail);
+                show_error_notification(&detail);
+                return;
+            }
             set_message("Aktualisierung bereit", "Die App startet gleich neu");
             unsafe { DestroyWindow(state.hwnd.load(Ordering::Acquire) as HWND) };
             return;
@@ -1538,35 +1562,108 @@ fn request_update() {
         "Suche Aktualisierung",
         "Die GitHub-Veröffentlichungen werden geprüft",
     );
+    let update_dir = state.paths.root.join("updates");
+    let result_path = update_dir.join(format!(
+        "update-result-{}-{}.json",
+        std::process::id(),
+        unix_seconds()
+    ));
+    let child = fs::create_dir_all(&update_dir).and_then(|()| {
+        let _ = fs::remove_file(&result_path);
+        std::process::Command::new(std::env::current_exe()?)
+            .arg("update-worker")
+            .arg(&result_path)
+            .spawn()
+    });
+    let mut child = match child {
+        Ok(child) => child,
+        Err(error) => {
+            *state.pending_error.lock().expect("background result") = Some(error.to_string());
+            post_work_finished(&state, WORK_UPDATE);
+            return;
+        }
+    };
     thread::spawn(move || {
-        let result = download_update(&state.paths);
+        let result = (|| -> super::AppResult<UpdateWorkerResult> {
+            let status = child.wait()?;
+            if !status.success() {
+                return Err("Die isolierte Aktualisierungsprüfung ist fehlgeschlagen.".into());
+            }
+            let payload = fs::read(&result_path)?;
+            Ok(serde_json::from_slice(&payload)?)
+        })();
+        let _ = fs::remove_file(&result_path);
         match result {
-            Ok(ready) => state.update_ready.store(ready, Ordering::Release),
+            Ok(outcome) => {
+                if let Some(error) = outcome.error {
+                    *state.pending_error.lock().expect("background result") = Some(error);
+                } else {
+                    *state.pending_update.lock().expect("prepared update") = outcome.helper;
+                }
+            }
             Err(error) => {
                 *state.pending_error.lock().expect("background result") = Some(error.to_string());
             }
         }
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
-                state.hwnd.load(Ordering::Acquire) as HWND,
-                WM_WORK_FINISHED,
-                WORK_UPDATE,
-                0,
-            )
-        };
+        post_work_finished(&state, WORK_UPDATE);
     });
 }
 
-fn download_update(paths: &AppPaths) -> super::AppResult<bool> {
+fn post_work_finished(state: &TrayState, kind: usize) {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
+            state.hwnd.load(Ordering::Acquire) as HWND,
+            WM_WORK_FINISHED,
+            kind,
+            0,
+        )
+    };
+}
+
+pub(super) fn run_update_worker(paths: &AppPaths, result_path: &Path) -> super::AppResult<()> {
+    let update_dir = paths.root.join("updates");
+    fs::create_dir_all(&update_dir)?;
+    let expected_parent = fs::canonicalize(&update_dir)?;
+    let actual_parent = result_path
+        .parent()
+        .ok_or("Ungültige Aktualisierungs-Ergebnisdatei.")?;
+    if fs::canonicalize(actual_parent)? != expected_parent
+        || !result_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(|name| name.starts_with("update-result-") && name.ends_with(".json"))
+    {
+        return Err("Unsicherer Pfad für die Aktualisierungs-Ergebnisdatei.".into());
+    }
+    let outcome = match prepare_update(paths) {
+        Ok(helper) => UpdateWorkerResult {
+            helper,
+            error: None,
+        },
+        Err(error) => UpdateWorkerResult {
+            helper: None,
+            error: Some(error.to_string()),
+        },
+    };
+    let temporary = result_path.with_extension("tmp");
+    let _ = fs::remove_file(&temporary);
+    fs::write(&temporary, serde_json::to_vec(&outcome)?)?;
+    let _ = fs::remove_file(result_path);
+    fs::rename(temporary, result_path)?;
+    Ok(())
+}
+
+fn prepare_update(paths: &AppPaths) -> super::AppResult<Option<PathBuf>> {
     let http = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .user_agent("google-photos-sync-rs-updater")
         .build()?;
     let response = http
         .get("https://api.github.com/repos/Henner4746/google-photos-sync-rs/releases/latest")
         .send()?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(false);
+        return Ok(None);
     }
     let release: serde_json::Value = response.error_for_status()?.json()?;
     let tag = release
@@ -1575,7 +1672,7 @@ fn download_update(paths: &AppPaths) -> super::AppResult<bool> {
         .unwrap_or("");
     let latest = tag.trim_start_matches('v');
     if !version_is_newer(latest, env!("CARGO_PKG_VERSION")) {
-        return Ok(false);
+        return Ok(None);
     }
     let asset = release
         .get("assets")
@@ -1609,12 +1706,7 @@ fn download_update(paths: &AppPaths) -> super::AppResult<bool> {
         let _ = fs::remove_file(&helper);
         return Err(error);
     }
-    std::process::Command::new(helper)
-        .arg("apply-update")
-        .arg(target)
-        .arg(std::process::id().to_string())
-        .spawn()?;
-    Ok(true)
+    Ok(Some(helper))
 }
 
 fn version_is_newer(candidate: &str, current: &str) -> bool {
@@ -2394,7 +2486,8 @@ fn copy_wide(target: &mut [u16], value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::sync_is_due_at;
+    use super::{UpdateWorkerResult, sync_is_due_at};
+    use std::path::PathBuf;
 
     #[test]
     fn startup_sync_only_runs_when_a_folder_is_due() {
@@ -2402,5 +2495,19 @@ mod tests {
         assert!(sync_is_due_at(1_001, 1_000));
         assert!(!sync_is_due_at(1_002, 1_000));
         assert!(!sync_is_due_at(1_900, 1_000));
+    }
+
+    #[test]
+    fn isolated_update_worker_result_roundtrips() {
+        let expected = UpdateWorkerResult {
+            helper: Some(PathBuf::from(
+                r"C:\ProgramData\GooglePhotosSync\updates\signed.exe",
+            )),
+            error: None,
+        };
+        let encoded = serde_json::to_vec(&expected).expect("serialize worker result");
+        let decoded: UpdateWorkerResult =
+            serde_json::from_slice(&encoded).expect("deserialize worker result");
+        assert_eq!(decoded, expected);
     }
 }
