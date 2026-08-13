@@ -109,6 +109,8 @@ struct AppConfig {
     auto_update: bool,
     #[serde(default)]
     takeout_imported_at: Option<i64>,
+    #[serde(default)]
+    takeout_not_required_confirmed: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -413,6 +415,7 @@ struct AppPaths {
     autostart_enabled: bool,
     auto_update: bool,
     takeout_imported_at: Option<i64>,
+    takeout_not_required_confirmed: bool,
 }
 
 impl AppPaths {
@@ -450,6 +453,7 @@ impl AppPaths {
             autostart_enabled: loaded.autostart_enabled,
             auto_update: loaded.auto_update,
             takeout_imported_at: loaded.takeout_imported_at,
+            takeout_not_required_confirmed: loaded.takeout_not_required_confirmed,
         })
     }
 }
@@ -563,6 +567,7 @@ fn write_example_config(path: &Path) -> AppResult<()> {
         autostart_enabled: true,
         auto_update: true,
         takeout_imported_at: None,
+        takeout_not_required_confirmed: false,
     };
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -581,6 +586,7 @@ fn save_config(
     autostart_enabled: bool,
     auto_update: bool,
     takeout_imported_at: Option<i64>,
+    takeout_not_required_confirmed: bool,
 ) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -594,6 +600,7 @@ fn save_config(
         autostart_enabled,
         auto_update,
         takeout_imported_at,
+        takeout_not_required_confirmed,
     };
     fs::write(path, serde_json::to_vec_pretty(&config)?)?;
     Ok(())
@@ -609,6 +616,13 @@ fn load_or_create_config(path: &Path) -> AppResult<AppConfig> {
     }
     write_example_config(path)?;
     Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn duplicate_guard_ready(
+    takeout_imported_at: Option<i64>,
+    no_older_copies_confirmed: bool,
+) -> bool {
+    takeout_imported_at.is_some_and(|timestamp| timestamp > 0) || no_older_copies_confirmed
 }
 
 fn load_credentials(path: &Path) -> AppResult<Credentials> {
@@ -1392,6 +1406,14 @@ fn sync(
     limit_per_source: Option<usize>,
     progress: Option<Arc<OperationProgress>>,
 ) -> AppResult<()> {
+    if !dry_run
+        && !duplicate_guard_ready(
+            paths.takeout_imported_at,
+            paths.takeout_not_required_confirmed,
+        )
+    {
+        return Err("Upload zum Schutz blockiert: Zuerst Takeout importieren oder in der Oberfläche bestätigen, dass keine älteren Kopien aus den gewählten Ordnern in Google Fotos liegen.".into());
+    }
     if let Some(progress) = &progress {
         progress.begin();
     }
@@ -2309,6 +2331,7 @@ mod tests {
             autostart_enabled: true,
             auto_update: true,
             takeout_imported_at: Some(99),
+            takeout_not_required_confirmed: false,
         };
         let encoded = serde_json::to_vec(&config).unwrap();
         let decoded: AppConfig = serde_json::from_slice(&encoded).unwrap();
@@ -2342,6 +2365,43 @@ mod tests {
         assert!(!decoded.onboarding_completed);
         assert!(decoded.autostart_enabled);
         assert!(decoded.auto_update);
+        assert!(!decoded.takeout_not_required_confirmed);
+    }
+
+    #[test]
+    fn duplicate_guard_requires_takeout_or_explicit_confirmation() {
+        assert!(!duplicate_guard_ready(None, false));
+        assert!(!duplicate_guard_ready(Some(0), false));
+        assert!(duplicate_guard_ready(Some(99), false));
+        assert!(duplicate_guard_ready(None, true));
+    }
+
+    #[test]
+    fn real_sync_stops_before_network_without_duplicate_guard() {
+        let root = env::temp_dir().join(format!("gphotos-duplicate-guard-{}", unix_seconds()));
+        let paths = AppPaths {
+            root: root.clone(),
+            credentials: root.join("credentials"),
+            database: root.join("database.db"),
+            log: root.join("sync.log"),
+            config: root.join("config.json"),
+            sources: Vec::new(),
+            window_position: None,
+            paused: false,
+            onboarding_completed: true,
+            autostart_enabled: false,
+            auto_update: false,
+            takeout_imported_at: None,
+            takeout_not_required_confirmed: false,
+        };
+        let logger = Logger::open(&paths.log).unwrap();
+
+        let error = sync(&paths, &logger, false, None, None).unwrap_err();
+        assert!(error.to_string().contains("Upload zum Schutz blockiert"));
+        assert!(sync(&paths, &logger, true, None, None).is_ok());
+
+        drop(logger);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

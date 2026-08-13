@@ -38,7 +38,7 @@ pub(super) unsafe fn paint(
     setup: bool,
     google_connected: bool,
     has_folder: bool,
-    takeout_imported: bool,
+    duplicate_protection_ready: bool,
     autostart: bool,
     settings: bool,
 ) {
@@ -56,7 +56,7 @@ pub(super) unsafe fn paint(
                 view,
                 google_connected,
                 has_folder,
-                takeout_imported,
+                duplicate_protection_ready,
                 autostart,
                 &fonts,
             );
@@ -227,7 +227,7 @@ unsafe fn setup_page(
     view: &ViewState,
     google_connected: bool,
     has_folder: bool,
-    takeout_imported: bool,
+    duplicate_protection_ready: bool,
     autostart: bool,
     fonts: &Fonts,
 ) {
@@ -292,7 +292,7 @@ unsafe fn setup_page(
         for (top, done) in [
             (242, google_connected),
             (306, has_folder),
-            (370, takeout_imported),
+            (370, duplicate_protection_ready),
             (434, autostart),
         ] {
             rounded_fill(
@@ -316,7 +316,11 @@ unsafe fn setup_page(
         );
         text(
             dc,
-            "Takeout wird nur lokal gelesen. Hochgeladen werden ausschließlich neue Inhalte.",
+            if duplicate_protection_ready {
+                "Duplikatschutz bestätigt. Hochgeladen werden ausschließlich neue Inhalte."
+            } else {
+                "Für ältere Google-Fotos zuerst Takeout importieren – alles bleibt lokal."
+            },
             rect(40, 590, 680, 628),
             TEXT_MUTED,
             DT_CENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_VCENTER,

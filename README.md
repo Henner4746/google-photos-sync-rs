@@ -18,12 +18,12 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 
 ## What it does
 
-- **First-run assistant.** Google sign-in, folder selection, the Google Photos limitation, optional Takeout import, and autostart are handled in the UI.
+- **First-run assistant.** Google sign-in, folder selection, the Google Photos limitation, recommended Takeout import, and autostart are handled in the UI.
 - **Explicit Google consent.** Immediately before sign-in, the app explains exactly what is uploaded, what it can read, where credentials stay, and that no own server is involved.
 - **Hardened desktop sign-in.** Google authorization uses the system browser, a random loopback port, state validation, and per-request PKCE S256 protection.
 - **Content-based duplicate protection.** SHA-256 identifies media independently of filename, path, source, or album. A known image or AMD clip is not uploaded again.
 - **Google-side recovery.** Content-addressed filenames reconcile media that this same app can see in Google Photos.
-- **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose. It remains available from Settings if it was skipped during setup.
+- **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose. Setup warns before proceeding without it, and real uploads stay blocked until Takeout was imported or the user explicitly confirms that no older copies from the selected folders exist.
 - **Per-folder controls.** Each folder has its own album, media type, enabled state, schedule, and excluded subfolders.
 - **Visible work.** Uploads show file progress and transfer speed; errors produce a Windows notification.
 - **Network recovery.** Upload and API calls retry transient failures with backoff. Anything not confirmed remains pending and resumes on the next run.

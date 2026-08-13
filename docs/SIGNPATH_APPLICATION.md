@@ -17,7 +17,7 @@ Application: <https://signpath.org/apply>
 
 Suggested description:
 
-> Google Photos Sync is a native, open-source Rust application for Windows 10 and 11. Users explicitly select local photo and video folders, connect their own Google Photos account, and optionally enable Windows autostart. SHA-256 content identification, a local SQLite index, and an optional local Google Takeout scan prevent repeated uploads. The app has no telemetry, advertising, proprietary backend, bundled third-party binaries, or paid edition. Windows executables and the Inno Setup installer are built automatically and verifiably from the public repository by GitHub-hosted Actions.
+> Google Photos Sync is a native, open-source Rust application for Windows 10 and 11. Users explicitly select local photo and video folders, connect their own Google Photos account, and optionally enable Windows autostart. SHA-256 content identification, a local SQLite index, and a recommended local Google Takeout scan prevent repeated uploads. Without Takeout, real uploads remain blocked until the user explicitly confirms that no older copies from the selected folders exist. The app has no telemetry, advertising, proprietary backend, bundled third-party binaries, or paid edition. Windows executables and the Inno Setup installer are built automatically and verifiably from the public repository by GitHub-hosted Actions.
 
 Artifacts to sign:
 

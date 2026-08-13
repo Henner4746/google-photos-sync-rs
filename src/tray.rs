@@ -3,9 +3,9 @@
 use super::{
     AppPaths, DEFAULT_SCHEDULE_MINUTES, Logger, MediaKind, OperationProgress, SingleInstance,
     SourceSpec, authorize, authorize_json, current_record, disconnect_google,
-    embedded_oauth_client, hex_encode, import_takeout, open_database, save_config,
-    set_autostart_executable, source_files, source_files_for_source, sync, trusted_state,
-    unix_seconds,
+    duplicate_guard_ready, embedded_oauth_client, hex_encode, import_takeout, open_database,
+    save_config, set_autostart_executable, source_files, source_files_for_source, sync,
+    trusted_state, unix_seconds,
 };
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -167,6 +167,7 @@ struct TrayState {
     autostart_enabled: AtomicBool,
     auto_update: AtomicBool,
     takeout_imported_at: AtomicI64,
+    takeout_not_required_confirmed: AtomicBool,
     progress: Arc<OperationProgress>,
     positioned: AtomicBool,
     next_run: AtomicI64,
@@ -194,6 +195,7 @@ pub(super) fn run(
     let initial_autostart_enabled = paths.autostart_enabled;
     let initial_auto_update = paths.auto_update;
     let initial_takeout_imported_at = paths.takeout_imported_at.unwrap_or(0);
+    let initial_takeout_not_required_confirmed = paths.takeout_not_required_confirmed;
     let initial_setup_mode = !initial_onboarding_completed || !state_ready_for_dashboard(&paths);
     let (protected, folders, pending) =
         counts(&paths, &initial_sources).unwrap_or((0, initial_sources.len(), 0));
@@ -221,6 +223,7 @@ pub(super) fn run(
         autostart_enabled: AtomicBool::new(initial_autostart_enabled),
         auto_update: AtomicBool::new(initial_auto_update),
         takeout_imported_at: AtomicI64::new(initial_takeout_imported_at),
+        takeout_not_required_confirmed: AtomicBool::new(initial_takeout_not_required_confirmed),
         progress: Arc::new(OperationProgress::default()),
         positioned: AtomicBool::new(false),
         next_run: AtomicI64::new(initial_next_run),
@@ -362,7 +365,7 @@ unsafe fn create_controls(hwnd: HWND, instance: HINSTANCE) -> super::AppResult<(
         (CMD_SETUP_FOLDER, "Sicherungsordner auswählen", SETUP_FOLDER),
         (
             CMD_SETUP_TAKEOUT,
-            "Google Takeout importieren (optional)",
+            "Takeout für sicheren Duplikatschutz",
             SETUP_TAKEOUT,
         ),
         (CMD_SETUP_AUTOSTART, "Mit Windows starten", SETUP_AUTOSTART),
@@ -912,7 +915,7 @@ fn handle_command(hwnd: HWND, command: usize) {
         CMD_SETUP_TAKEOUT => setup_takeout(hwnd),
         CMD_SETTINGS_TAKEOUT => setup_takeout(hwnd),
         CMD_SETUP_AUTOSTART => toggle_autostart(),
-        CMD_SETUP_FINISH => finish_setup(),
+        CMD_SETUP_FINISH => finish_setup(hwnd),
         CMD_SETTINGS => toggle_settings(),
         CMD_SCHEDULE => cycle_schedule(),
         CMD_EXCLUDE => exclude_subfolder(hwnd),
@@ -1169,7 +1172,31 @@ fn toggle_autostart() {
     }
 }
 
-fn finish_setup() {
+fn duplicate_protection_ready(state: &TrayState) -> bool {
+    duplicate_guard_ready(
+        match state.takeout_imported_at.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        },
+        state.takeout_not_required_confirmed.load(Ordering::Acquire),
+    )
+}
+
+fn confirm_no_older_copies(hwnd: HWND) -> bool {
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(
+                "Google darf ältere Fotos seit März 2025 nicht an diese App melden. Ohne Takeout kann die App deshalb nicht erkennen, ob Dateien aus den gewählten Ordnern schon in Google Fotos liegen.\n\nFahre nur ohne Takeout fort, wenn dort keine älteren Kopien aus diesen Ordnern vorhanden sind. Andernfalls wähle Nein und importiere zuerst Takeout.\n\nOhne Takeout fortfahren?",
+            )
+            .as_ptr(),
+            wide("Sicher vor doppelten Uploads").as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        ) == IDYES
+    }
+}
+
+fn finish_setup(hwnd: HWND) {
     let state = STATE.get().expect("tray state");
     if !state.paths.credentials.is_file() || state.sources.lock().expect("source state").is_empty()
     {
@@ -1178,6 +1205,18 @@ fn finish_setup() {
             "Google verbinden und mindestens einen Ordner auswählen",
         );
         return;
+    }
+    if !duplicate_protection_ready(state) {
+        if !confirm_no_older_copies(hwnd) {
+            set_message(
+                "Takeout schützt vor doppelten Uploads",
+                "Takeout auswählen, danach die Einrichtung abschließen",
+            );
+            return;
+        }
+        state
+            .takeout_not_required_confirmed
+            .store(true, Ordering::Release);
     }
     state.onboarding_completed.store(true, Ordering::Release);
     state.setup_mode.store(false, Ordering::Release);
@@ -1252,6 +1291,9 @@ fn finish_background_work(kind: usize) {
         state
             .takeout_imported_at
             .store(unix_seconds(), Ordering::Release);
+        state
+            .takeout_not_required_confirmed
+            .store(false, Ordering::Release);
         let _ = persist_sources();
         set_message(
             "Takeout importiert",
@@ -1839,6 +1881,20 @@ fn request_sync(manual: bool, dry_run: bool) {
         state.next_run.store(unix_seconds() + 60, Ordering::Release);
         return;
     }
+    if !dry_run && !duplicate_protection_ready(&state) {
+        if manual && confirm_no_older_copies(state.hwnd.load(Ordering::Acquire) as HWND) {
+            state
+                .takeout_not_required_confirmed
+                .store(true, Ordering::Release);
+            let _ = persist_sources();
+        } else {
+            set_message(
+                "Upload zum Schutz blockiert",
+                "Zuerst Takeout importieren oder ausdrücklich bestätigen, dass kein Altbestand existiert",
+            );
+            return;
+        }
+    }
     if !state
         .sources
         .lock()
@@ -1898,6 +1954,12 @@ fn request_sync(manual: bool, dry_run: bool) {
         }
         let mut paths = state.paths.clone();
         paths.sources = sources.clone();
+        paths.takeout_imported_at = match state.takeout_imported_at.load(Ordering::Acquire) {
+            0 => None,
+            value => Some(value),
+        };
+        paths.takeout_not_required_confirmed =
+            state.takeout_not_required_confirmed.load(Ordering::Acquire);
         let progress = state.progress.clone();
         let result = match SingleInstance::acquire() {
             Ok(_instance) => sync(&paths, &state.logger, dry_run, None, Some(progress)),
@@ -1979,6 +2041,7 @@ fn persist_sources() -> super::AppResult<()> {
             0 => None,
             value => Some(value),
         },
+        state.takeout_not_required_confirmed.load(Ordering::Acquire),
     )
 }
 
@@ -2224,7 +2287,7 @@ fn paint_dashboard(hwnd: HWND) {
             state.setup_mode.load(Ordering::Acquire),
             state.paths.credentials.is_file(),
             !state.sources.lock().expect("source state").is_empty(),
-            state.takeout_imported_at.load(Ordering::Acquire) > 0,
+            duplicate_protection_ready(state),
             state.autostart_enabled.load(Ordering::Acquire),
             state.settings_mode.load(Ordering::Acquire),
         );

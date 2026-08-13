@@ -51,7 +51,7 @@ Record one continuous, unedited video with non-personal sample media:
 5. Select a sample folder, explain autostart, and finish setup.
 6. Run a test sync, then a real upload of one sample image and show the confirmed result in Google Photos.
 7. Run the same sync again and show that the known file is skipped.
-8. Show the March 2025 API limitation and optional local Takeout import.
+8. Show the March 2025 API limitation, the recommended local Takeout import, and the upload block shown when neither Takeout nor an explicit no-older-copies confirmation exists.
 9. Open Settings, choose `Google trennen`, confirm, and show that the setup screen returns while the uploaded sample remains in Google Photos.
 
 Do not show OAuth JSON, client secrets, refresh tokens, private media, personal folder paths, browser cookies, or unrelated Google account data.
