@@ -22,6 +22,8 @@ Use a dedicated production project, enable the Google Photos Library API, config
 
 The user explicitly selects local image and video folders in the first-run UI. The app uploads only new media from those folders to the user's own Google Photos account. It cannot modify or delete existing Google Photos media and does not operate a proxy server.
 
+The desktop authorization flow opens the system browser and returns through a random `127.0.0.1` loopback port. Every request uses an independent state value and PKCE S256 verifier; the verifier is included only during the code exchange. An abandoned browser flow times out without leaving the app permanently busy.
+
 ### `https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata`
 
 The app reads metadata only for Google Photos media created by this same application. This narrow access is used to reconcile confirmed uploads after a local database loss or interrupted request and to prevent repeated uploads. It cannot enumerate the user's wider Google Photos library.

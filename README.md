@@ -20,16 +20,17 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 
 - **First-run assistant.** Google sign-in, folder selection, the Google Photos limitation, optional Takeout import, and autostart are handled in the UI.
 - **Explicit Google consent.** Immediately before sign-in, the app explains exactly what is uploaded, what it can read, where credentials stay, and that no own server is involved.
+- **Hardened desktop sign-in.** Google authorization uses the system browser, a random loopback port, state validation, and per-request PKCE S256 protection.
 - **Content-based duplicate protection.** SHA-256 identifies media independently of filename, path, source, or album. A known image or AMD clip is not uploaded again.
 - **Google-side recovery.** Content-addressed filenames reconcile media that this same app can see in Google Photos.
-- **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose.
+- **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose. It remains available from Settings if it was skipped during setup.
 - **Per-folder controls.** Each folder has its own album, media type, enabled state, schedule, and excluded subfolders.
 - **Visible work.** Uploads show file progress and transfer speed; errors produce a Windows notification.
 - **Network recovery.** Upload and API calls retry transient failures with backoff. Anything not confirmed remains pending and resumes on the next run.
 - **Persistent state.** Paused state, schedules, window position, and last successful runs survive restarts.
 - **Local backup and restore.** Settings, the duplicate database, and DPAPI-protected credentials can be backed up from the app.
 - **Revocable access.** `Google trennen` revokes the Google token and removes the local encrypted credential without deleting photos.
-- **Verified updates.** The updater requires the GitHub SHA-256 digest, a trusted Windows Authenticode signature, and the same publisher as the installed app. It verifies the signature again immediately before replacement.
+- **Verified updates.** The updater checks at startup and then daily. It requires the GitHub SHA-256 digest, a trusted Windows Authenticode signature, and the same publisher as the installed app, and verifies again immediately before replacement.
 - **Low overhead.** Native Win32 UI, SQLite, four upload streams, and small optimized Rust release builds.
 
 ## Install

@@ -675,6 +675,26 @@ fn default_token_uri() -> String {
     GOOGLE_TOKEN.to_owned()
 }
 
+fn validate_google_oauth_client(client: &OAuthDesktopClient) -> AppResult<()> {
+    if !client.client_id.ends_with(".apps.googleusercontent.com") {
+        return Err("Die ausgewählte Datei enthält keine Google-Desktop-Client-ID.".into());
+    }
+    if client.client_secret.trim().is_empty() {
+        return Err("In der Google-OAuth-Datei fehlt der Desktop-Client-Schlüssel.".into());
+    }
+    if !matches!(
+        client.auth_uri.as_str(),
+        "https://accounts.google.com/o/oauth2/auth"
+            | "https://accounts.google.com/o/oauth2/v2/auth"
+    ) {
+        return Err("Die OAuth-Datei verweist nicht auf Googles Anmeldedienst.".into());
+    }
+    if client.token_uri != GOOGLE_TOKEN {
+        return Err("Die OAuth-Datei verweist nicht auf Googles Token-Dienst.".into());
+    }
+    Ok(())
+}
+
 fn authorize(paths: &AppPaths, input: &Path) -> AppResult<()> {
     authorize_json(paths, &fs::read(input)?)
 }
@@ -687,25 +707,46 @@ fn embedded_oauth_client() -> Option<&'static [u8]> {
 
 fn authorize_json(paths: &AppPaths, input: &[u8]) -> AppResult<()> {
     let client_file: OAuthClientFile = serde_json::from_slice(input)?;
+    validate_google_oauth_client(&client_file.installed)?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
     let state = oauth_state()?;
+    let code_verifier = pkce_verifier()?;
+    let code_challenge = pkce_challenge(&code_verifier);
     let scope = "https://www.googleapis.com/auth/photoslibrary.appendonly https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata";
     let authorization_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}&code_challenge={}&code_challenge_method=S256",
         client_file.installed.auth_uri,
         url_encode(&client_file.installed.client_id),
         url_encode(&redirect_uri),
         url_encode(scope),
         url_encode(&state),
+        url_encode(&code_challenge),
     );
     Command::new("rundll32.exe")
         .args(["url.dll,FileProtocolHandler", &authorization_url])
         .spawn()?;
     println!("Google-Anmeldung wurde im Browser ge\u{00f6}ffnet.");
 
-    let (mut stream, _) = listener.accept()?;
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(
+                        "Die Google-Anmeldung wurde nach zehn Minuten beendet. Bitte erneut versuchen."
+                            .into(),
+                    );
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(60)))?;
     let mut request = [0_u8; 16 * 1024];
     let length = stream.read(&mut request)?;
@@ -739,7 +780,18 @@ fn authorize_json(paths: &AppPaths, input: &[u8]) -> AppResult<()> {
         body.len()
     );
     stream.write_all(response.as_bytes())?;
-    let code = code.ok_or("OAuth-Antwort enthielt keinen g\u{00fc}ltigen Code.")?;
+    let code = code.ok_or_else(|| {
+        if !valid_state {
+            "Die Google-Anmeldung enthielt einen ungültigen Sicherheitsstatus.".to_owned()
+        } else if parameters
+            .get("error")
+            .is_some_and(|error| error == "access_denied")
+        {
+            "Die Google-Anmeldung wurde abgebrochen.".to_owned()
+        } else {
+            "Die Google-Anmeldung enthielt keinen gültigen Code.".to_owned()
+        }
+    })?;
 
     let value: Value = Client::builder()
         .timeout(Duration::from_secs(60))
@@ -754,6 +806,7 @@ fn authorize_json(paths: &AppPaths, input: &[u8]) -> AppResult<()> {
             ),
             ("redirect_uri", redirect_uri.as_str()),
             ("grant_type", "authorization_code"),
+            ("code_verifier", code_verifier.as_str()),
         ])
         .send()?
         .error_for_status()?
@@ -838,6 +891,21 @@ fn url_encode(value: &str) -> String {
 
 fn oauth_state() -> AppResult<String> {
     let mut bytes = [0_u8; 32];
+    secure_random(&mut bytes)?;
+    Ok(hex_encode(&bytes))
+}
+
+fn pkce_verifier() -> AppResult<String> {
+    let mut bytes = [0_u8; 32];
+    secure_random(&mut bytes)?;
+    Ok(base64_url_no_padding(&bytes))
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    base64_url_no_padding(&Sha256::digest(verifier.as_bytes()))
+}
+
+fn secure_random(bytes: &mut [u8]) -> AppResult<()> {
     let status = unsafe {
         BCryptGenRandom(
             std::ptr::null_mut(),
@@ -849,7 +917,38 @@ fn oauth_state() -> AppResult<String> {
     if status < 0 {
         return Err(format!("Sicherer Zufallswert konnte nicht erzeugt werden: {status}").into());
     }
-    Ok(hex_encode(&bytes))
+    Ok(())
+}
+
+fn base64_url_no_padding(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity((bytes.len() * 4).div_ceil(3));
+    let mut index = 0;
+    while index + 3 <= bytes.len() {
+        let bits = (u32::from(bytes[index]) << 16)
+            | (u32::from(bytes[index + 1]) << 8)
+            | u32::from(bytes[index + 2]);
+        encoded.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+        encoded.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+        encoded.push(ALPHABET[((bits >> 6) & 0x3f) as usize] as char);
+        encoded.push(ALPHABET[(bits & 0x3f) as usize] as char);
+        index += 3;
+    }
+    match bytes.len() - index {
+        1 => {
+            let bits = u32::from(bytes[index]) << 16;
+            encoded.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+            encoded.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+        }
+        2 => {
+            let bits = (u32::from(bytes[index]) << 16) | (u32::from(bytes[index + 1]) << 8);
+            encoded.push(ALPHABET[((bits >> 18) & 0x3f) as usize] as char);
+            encoded.push(ALPHABET[((bits >> 12) & 0x3f) as usize] as char);
+            encoded.push(ALPHABET[((bits >> 6) & 0x3f) as usize] as char);
+        }
+        _ => {}
+    }
+    encoded
 }
 
 fn url_decode(value: &str) -> String {
@@ -2152,6 +2251,43 @@ mod tests {
     fn oauth_query_values_roundtrip() {
         let value = "https://localhost/callback?scope=one two&state=ä";
         assert_eq!(url_decode(&url_encode(value)), value);
+    }
+
+    #[test]
+    fn pkce_uses_rfc_7636_s256_encoding() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn generated_pkce_verifier_has_required_shape() {
+        let verifier = pkce_verifier().unwrap();
+        assert_eq!(verifier.len(), 43);
+        assert!(
+            verifier
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        );
+    }
+
+    #[test]
+    fn oauth_client_validation_accepts_only_google_desktop_endpoints() {
+        let valid = OAuthDesktopClient {
+            client_id: "123.apps.googleusercontent.com".to_owned(),
+            client_secret: "desktop-secret".to_owned(),
+            auth_uri: "https://accounts.google.com/o/oauth2/auth".to_owned(),
+            token_uri: GOOGLE_TOKEN.to_owned(),
+        };
+        assert!(validate_google_oauth_client(&valid).is_ok());
+
+        let foreign = OAuthDesktopClient {
+            token_uri: "https://example.com/token".to_owned(),
+            ..valid
+        };
+        assert!(validate_google_oauth_client(&foreign).is_err());
     }
 
     #[test]

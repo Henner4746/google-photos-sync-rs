@@ -29,6 +29,24 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:GPHOTOS_SYNC_OAUTH_CLIENT_JSON)) {
             throw 'Release blocked: configure GPHOTOS_SYNC_OAUTH_CLIENT_JSON.'
           }
+          try {
+            $oauth = $env:GPHOTOS_SYNC_OAUTH_CLIENT_JSON | ConvertFrom-Json -ErrorAction Stop
+          } catch {
+            throw 'Release blocked: GPHOTOS_SYNC_OAUTH_CLIENT_JSON is not valid JSON.'
+          }
+          $desktop = $oauth.installed
+          $allowedAuthUris = @(
+            'https://accounts.google.com/o/oauth2/auth',
+            'https://accounts.google.com/o/oauth2/v2/auth'
+          )
+          if (!$desktop -or
+              [string]::IsNullOrWhiteSpace($desktop.client_id) -or
+              $desktop.client_id -notmatch '\.apps\.googleusercontent\.com$' -or
+              [string]::IsNullOrWhiteSpace($desktop.client_secret) -or
+              $allowedAuthUris -notcontains $desktop.auth_uri -or
+              $desktop.token_uri -ne 'https://oauth2.googleapis.com/token') {
+            throw 'Release blocked: OAuth secret is not a valid Google Desktop client JSON.'
+          }
 
           $pfxReady = ![string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_BASE64) -and
             ![string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)

@@ -68,6 +68,7 @@ const TIMER_SCHEDULE: usize = 1;
 const TIMER_INITIAL: usize = 2;
 const TIMER_ANIMATION: usize = 3;
 const TIMER_UPDATE: usize = 4;
+const UPDATE_INTERVAL_MS: u32 = 24 * 60 * 60 * 1_000;
 const CMD_OPEN: usize = 1001;
 const CMD_SYNC: usize = 1002;
 const CMD_EXIT: usize = 1003;
@@ -95,6 +96,7 @@ const CMD_RESTORE: usize = 1024;
 const CMD_SETTINGS: usize = 1025;
 const CMD_UPDATE: usize = 1026;
 const CMD_DISCONNECT_GOOGLE: usize = 1027;
+const CMD_SETTINGS_TAKEOUT: usize = 1028;
 const WM_WORK_FINISHED: u32 = WM_APP + 2;
 const WORK_GOOGLE: usize = 1;
 const WORK_TAKEOUT: usize = 2;
@@ -128,6 +130,7 @@ const SETTINGS_SCHEDULE: RECT = rect(40, 168, 680, 216);
 const SETTINGS_EXCLUDE: RECT = rect(40, 232, 680, 280);
 const SETTINGS_BACKUP: RECT = rect(40, 328, 350, 376);
 const SETTINGS_RESTORE: RECT = rect(370, 328, 680, 376);
+const SETTINGS_TAKEOUT: RECT = rect(40, 446, 680, 486);
 const SETTINGS_UPDATE: RECT = rect(40, 526, 350, 578);
 const SETTINGS_DISCONNECT: RECT = rect(370, 526, 680, 578);
 
@@ -369,6 +372,11 @@ unsafe fn create_controls(hwnd: HWND, instance: HINSTANCE) -> super::AppResult<(
         (CMD_EXCLUDE, "Unterordner ausschließen", SETTINGS_EXCLUDE),
         (CMD_BACKUP, "Daten sichern", SETTINGS_BACKUP),
         (CMD_RESTORE, "Daten wiederherstellen", SETTINGS_RESTORE),
+        (
+            CMD_SETTINGS_TAKEOUT,
+            "Google Takeout importieren",
+            SETTINGS_TAKEOUT,
+        ),
         (CMD_UPDATE, "Nach Aktualisierung suchen", SETTINGS_UPDATE),
         (CMD_DISCONNECT_GOOGLE, "Google trennen", SETTINGS_DISCONNECT),
     ];
@@ -902,6 +910,7 @@ fn handle_command(hwnd: HWND, command: usize) {
         CMD_SETUP_GOOGLE => setup_google(hwnd),
         CMD_SETUP_FOLDER => add_source(hwnd),
         CMD_SETUP_TAKEOUT => setup_takeout(hwnd),
+        CMD_SETTINGS_TAKEOUT => setup_takeout(hwnd),
         CMD_SETUP_AUTOSTART => toggle_autostart(),
         CMD_SETUP_FINISH => finish_setup(),
         CMD_SETTINGS => toggle_settings(),
@@ -974,6 +983,7 @@ fn refresh_mode_controls() {
             CMD_EXCLUDE,
             CMD_BACKUP,
             CMD_RESTORE,
+            CMD_SETTINGS_TAKEOUT,
             CMD_UPDATE,
             CMD_DISCONNECT_GOOGLE,
         ] {
@@ -1014,6 +1024,15 @@ fn refresh_mode_controls() {
                 "Mit Windows starten: Ein"
             } else {
                 "Mit Windows starten: Aus"
+            })
+            .as_ptr(),
+        );
+        SetWindowTextW(
+            GetDlgItem(hwnd, CMD_SETTINGS_TAKEOUT as i32),
+            wide(if state.takeout_imported_at.load(Ordering::Acquire) > 0 {
+                "Google Takeout aktualisieren"
+            } else {
+                "Google Takeout importieren"
             })
             .as_ptr(),
         );
@@ -1206,6 +1225,16 @@ fn disconnect_google_account(hwnd: HWND) {
 fn finish_background_work(kind: usize) {
     let state = STATE.get().expect("tray state");
     state.working.store(false, Ordering::Release);
+    if kind == WORK_UPDATE && state.auto_update.load(Ordering::Acquire) {
+        unsafe {
+            SetTimer(
+                state.hwnd.load(Ordering::Acquire) as HWND,
+                TIMER_UPDATE,
+                UPDATE_INTERVAL_MS,
+                None,
+            );
+        }
+    }
     if let Some(error) = state
         .pending_error
         .lock()
