@@ -23,13 +23,15 @@ jobs:
           )
           foreach ($needle in $forbidden) {
             $matches = git grep -n -I -F -- $needle
-            if ($LASTEXITCODE -eq 0) {
+            $grepExitCode = $LASTEXITCODE
+            if ($grepExitCode -eq 0) {
               throw "Personal workstation trace found: $needle`n$matches"
             }
-            if ($LASTEXITCODE -ne 1) {
+            if ($grepExitCode -ne 1) {
               throw "Repository trace scan failed for: $needle"
             }
           }
+          exit 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1
