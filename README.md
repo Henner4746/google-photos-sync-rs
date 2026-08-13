@@ -30,12 +30,12 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 - **Persistent state.** Paused state, schedules, window position, and last successful runs survive restarts.
 - **Local backup and restore.** Settings, the duplicate database, and DPAPI-protected credentials can be backed up from the app.
 - **Revocable access.** `Google trennen` revokes the Google token and removes the local encrypted credential without deleting photos.
-- **Verified updates.** The updater checks at startup and then daily. It requires the GitHub SHA-256 digest, a trusted Windows Authenticode signature, and the same publisher as the installed app, and verifies again immediately before replacement.
+- **Verified updates.** The updater checks at startup and then daily. No stable release is treated as a normal no-update result. An available update requires the GitHub SHA-256 digest, a trusted Windows Authenticode signature, and the same publisher as the installed app, and is verified again immediately before replacement.
 - **Low overhead.** Native Win32 UI, SQLite, four upload streams, and small optimized Rust release builds.
 
 ## Install
 
-The supported public installer is not available yet. The older `v1.1.0` release is an unsigned development binary and is not the finished public product. Its direct download is intentionally not promoted. Once OAuth verification and code signing are complete, download the signed `Google-Photos-Sync-Setup.exe`, verify its Windows signature, run it, and follow the first-run assistant. The installer is per-user, adds a clean Windows autostart entry when selected, and provides a normal uninstaller.
+The supported public installer is not available yet. The older `v1.0.0` and `v1.1.0` releases are unsigned development binaries and are not the finished public product. Their direct downloads are intentionally not promoted. Once OAuth verification and code signing are complete, download the signed `Google-Photos-Sync-Setup.exe`, verify its Windows signature, run it, and follow the first-run assistant. The installer is per-user, adds a clean Windows autostart entry when selected, and provides a normal uninstaller.
 
 Public v2 releases are created only after the release workflow has verified a trusted Windows signature. The workflow supports either a project certificate or the managed open-source signing path described in the [code signing policy](CODE_SIGNING_POLICY.md); it refuses to publish unsigned artifacts.
 

@@ -1538,11 +1538,13 @@ fn download_update(paths: &AppPaths) -> super::AppResult<bool> {
         .timeout(std::time::Duration::from_secs(300))
         .user_agent("google-photos-sync-rs-updater")
         .build()?;
-    let release: serde_json::Value = http
+    let response = http
         .get("https://api.github.com/repos/Henner4746/google-photos-sync-rs/releases/latest")
-        .send()?
-        .error_for_status()?
-        .json()?;
+        .send()?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    let release: serde_json::Value = response.error_for_status()?.json()?;
     let tag = release
         .get("tag_name")
         .and_then(serde_json::Value::as_str)
