@@ -12,7 +12,7 @@
   <h1>Code signing policy</h1>
   <section class="card">
     <h2>Trusted releases</h2>
-    <p>Official Windows releases are built from the public source repository by GitHub Actions. The release workflow verifies Authenticode signatures and SHA-256 checksums before publication.</p>
+    <p>Supported Windows releases, beginning with v2, are built from the public source repository by GitHub Actions. The release workflow verifies Authenticode signatures and SHA-256 checksums before publication. The older v1.1.0 development binary is unsigned and is not a supported public installer.</p>
   </section>
   <h2>Signing provider</h2>
   <p>Free code signing provided by <a href="https://about.signpath.io/">SignPath.io</a>, certificate by <a href="https://signpath.org/">SignPath Foundation</a>.</p>
@@ -23,7 +23,7 @@
   <p>The app transfers selected media only when the user explicitly configures Google Photos synchronization. It has no telemetry, advertising, or own backend. See the <a href="privacy.html">privacy policy</a>.</p>
   <p>The installer announces its installation path and autostart behavior and provides a normal Windows uninstaller.</p>
   <h2>Verification</h2>
-  <p>Download only from the <a href="https://github.com/Henner4746/google-photos-sync-rs/releases">official releases page</a>. Each release includes SHA-256 checksums. The Windows signature can be inspected in the file properties.</p>
+  <p>Once signed v2 releases are available, download them only from the <a href="https://github.com/Henner4746/google-photos-sync-rs/releases">official releases page</a>. Supported releases include SHA-256 checksums. The Windows signature can be inspected in the file properties.</p>
   <footer><a href="./">Homepage</a> · <a href="privacy.html">Privacy</a> · <a href="https://github.com/Henner4746/google-photos-sync-rs">Source</a></footer>
 </main>
 </body>

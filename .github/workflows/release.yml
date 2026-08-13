@@ -178,6 +178,21 @@ jobs:
             Where-Object FullName -Match '\\x64\\signtool.exe$' | Sort-Object FullName -Descending | Select-Object -First 1
           & $signtool.FullName verify /pa /v dist\Google-Photos-Sync-Setup.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify consistent release publisher
+        shell: pwsh
+        run: |
+          $appSignature = Get-AuthenticodeSignature target\release\gphotos-sync.exe
+          $installerSignature = Get-AuthenticodeSignature dist\Google-Photos-Sync-Setup.exe
+          if ($appSignature.Status -ne 'Valid' -or !$appSignature.SignerCertificate) {
+            throw "Application signature is not trusted: $($appSignature.Status)"
+          }
+          if ($installerSignature.Status -ne 'Valid' -or !$installerSignature.SignerCertificate) {
+            throw "Installer signature is not trusted: $($installerSignature.Status)"
+          }
+          if ($appSignature.SignerCertificate.Thumbprint -ne $installerSignature.SignerCertificate.Thumbprint) {
+            throw 'Application and installer must use the same signing certificate.'
+          }
+          "Verified publisher: $($appSignature.SignerCertificate.Subject)"
       - name: Create checksums
         shell: pwsh
         run: |

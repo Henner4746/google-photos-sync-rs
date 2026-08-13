@@ -8,7 +8,7 @@
 ![Rust](https://img.shields.io/badge/Rust-1.91+-111111?style=flat-square&logo=rust&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-111111?style=flat-square)
 
-[Download](https://github.com/Henner4746/google-photos-sync-rs/releases/latest) · [Homepage](https://henner4746.github.io/google-photos-sync-rs/) · [Privacy](https://henner4746.github.io/google-photos-sync-rs/privacy.html)
+**Signed v2 installer: in preparation** · [Homepage](https://henner4746.github.io/google-photos-sync-rs/) · [Privacy](https://henner4746.github.io/google-photos-sync-rs/privacy.html)
 
 </div>
 
@@ -35,7 +35,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 
 ## Install
 
-Download `Google-Photos-Sync-Setup.exe` from the [latest release](https://github.com/Henner4746/google-photos-sync-rs/releases/latest), run it, and follow the first-run assistant. The installer is per-user, adds a clean Windows autostart entry when selected, and provides a normal uninstaller.
+The supported public installer is not available yet. The older `v1.1.0` release is an unsigned development binary and is not the finished public product. Its direct download is intentionally not promoted. Once OAuth verification and code signing are complete, download the signed `Google-Photos-Sync-Setup.exe`, verify its Windows signature, run it, and follow the first-run assistant. The installer is per-user, adds a clean Windows autostart entry when selected, and provides a normal uninstaller.
 
 Public v2 releases are created only after the release workflow has verified a trusted Windows signature. The workflow supports either a project certificate or the managed open-source signing path described in the [code signing policy](CODE_SIGNING_POLICY.md); it refuses to publish unsigned artifacts.
 

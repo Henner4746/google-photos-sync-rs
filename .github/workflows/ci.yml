@@ -32,6 +32,13 @@ jobs:
             }
           }
           exit 0
+      - name: Do not promote the unsigned legacy release
+        shell: pwsh
+        run: |
+          $matches = Select-String -Path README.md,docs\index.html -Pattern 'releases/latest|Für Windows laden'
+          if ($matches) {
+            throw "The public pages must not promote a download until the signed v2 installer exists.`n$matches"
+          }
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.91.1

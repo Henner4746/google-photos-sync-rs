@@ -1,6 +1,6 @@
 # Code signing policy
 
-Official Windows releases of Google Photos Sync are built from the public source repository by GitHub Actions. Release artifacts are accepted only after their Authenticode signatures and SHA-256 checksums have been verified by the release workflow.
+Supported Windows releases of Google Photos Sync, beginning with v2, are built from the public source repository by GitHub Actions. Release artifacts are accepted only after their Authenticode signatures and SHA-256 checksums have been verified by the release workflow. The older v1.1.0 development binary is unsigned and is not a supported public installer.
 
 The in-app updater independently repeats these checks on the user's PC. It accepts an executable only when the GitHub release digest matches, Windows trusts its Authenticode chain, and its publisher matches the currently installed executable. The helper verifies both signatures and the publisher again immediately before replacing the running app.
 
@@ -22,7 +22,7 @@ The installer announces its installation path and autostart behavior, provides a
 
 ## Verification
 
-Users should download releases only from the [official GitHub Releases page](https://github.com/Henner4746/google-photos-sync-rs/releases). Each release contains SHA-256 checksums. Windows signatures can be inspected in file properties or with:
+Once signed v2 releases are available, users should download them only from the [official GitHub Releases page](https://github.com/Henner4746/google-photos-sync-rs/releases). Supported releases contain SHA-256 checksums. Windows signatures can be inspected in file properties or with:
 
 ```powershell
 Get-AuthenticodeSignature .\Google-Photos-Sync-Setup.exe
