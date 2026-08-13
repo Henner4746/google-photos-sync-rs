@@ -46,8 +46,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, GetCursorPos,
     GetDlgCtrlID, GetDlgItem, GetMessageW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     HMENU, HTCAPTION, HTCLIENT, HWND_TOP, ICONINFO, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW,
-    KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMHEIGHT,
-    LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
+    IsWindowVisible, KillTimer, LB_ADDSTRING, LB_GETCURSEL, LB_RESETCONTENT, LB_SETCURSEL,
+    LB_SETITEMHEIGHT, LBN_DBLCLK, LBN_SELCHANGE, LBS_HASSTRINGS, LBS_NOINTEGRALHEIGHT, LBS_NOTIFY,
     LBS_OWNERDRAWFIXED, LoadCursorW, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, MF_SEPARATOR,
     MF_STRING, MSG, MessageBoxW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
     SW_SHOW, SW_SHOWNORMAL, SWP_SHOWWINDOW, SendMessageW, SetCursor, SetForegroundWindow, SetTimer,
@@ -68,6 +68,9 @@ const TIMER_SCHEDULE: usize = 1;
 const TIMER_INITIAL: usize = 2;
 const TIMER_ANIMATION: usize = 3;
 const TIMER_UPDATE: usize = 4;
+const SCHEDULE_INTERVAL_MS: u32 = 60_000;
+const ANIMATION_INTERVAL_MS: u32 = 250;
+const INITIAL_UPDATE_DELAY_MS: u32 = 60_000;
 const UPDATE_INTERVAL_MS: u32 = 24 * 60 * 60 * 1_000;
 const CMD_OPEN: usize = 1001;
 const CMD_SYNC: usize = 1002;
@@ -179,6 +182,7 @@ struct TrayState {
     pending_error: Mutex<Option<String>>,
     settings_mode: AtomicBool,
     update_ready: AtomicBool,
+    counts_loaded: AtomicBool,
 }
 
 pub(super) fn run(
@@ -189,7 +193,7 @@ pub(super) fn run(
 ) -> super::AppResult<()> {
     let _tray_instance = SingleInstance::acquire_tray()?;
     let initial_sources = paths.sources.clone();
-    let initial_next_run = next_due_time(&initial_sources).min(unix_seconds() + 2);
+    let initial_next_run = next_due_time(&initial_sources);
     let initial_paused = paths.paused;
     let initial_onboarding_completed = paths.onboarding_completed;
     let initial_autostart_enabled = paths.autostart_enabled;
@@ -197,8 +201,14 @@ pub(super) fn run(
     let initial_takeout_imported_at = paths.takeout_imported_at.unwrap_or(0);
     let initial_takeout_not_required_confirmed = paths.takeout_not_required_confirmed;
     let initial_setup_mode = !initial_onboarding_completed || !state_ready_for_dashboard(&paths);
-    let (protected, folders, pending) =
-        counts(&paths, &initial_sources).unwrap_or((0, initial_sources.len(), 0));
+    let load_initial_counts = show_on_start || initial_setup_mode || !sync_on_start;
+    let (protected, folders, pending) = if load_initial_counts {
+        counts(&paths, &initial_sources).unwrap_or((0, initial_sources.len(), 0))
+    } else {
+        // Autostart stays lightweight: the due sync refreshes these values once instead of
+        // walking every configured folder twice during Windows sign-in.
+        (0, initial_sources.len(), 0)
+    };
     let state = Arc::new(TrayState {
         window_position: Mutex::new(paths.window_position),
         paths,
@@ -235,6 +245,7 @@ pub(super) fn run(
         pending_error: Mutex::new(None),
         settings_mode: AtomicBool::new(false),
         update_ready: AtomicBool::new(false),
+        counts_loaded: AtomicBool::new(load_initial_counts),
     });
     STATE
         .set(state)
@@ -297,8 +308,7 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
             1,
         );
         add_tray_icon(hwnd)?;
-        SetTimer(hwnd, TIMER_SCHEDULE, 30_000, None);
-        SetTimer(hwnd, TIMER_ANIMATION, 120, None);
+        SetTimer(hwnd, TIMER_SCHEDULE, SCHEDULE_INTERVAL_MS, None);
         if STATE
             .get()
             .expect("tray state")
@@ -310,7 +320,7 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
                 .setup_mode
                 .load(Ordering::Acquire)
         {
-            SetTimer(hwnd, TIMER_UPDATE, 20_000, None);
+            SetTimer(hwnd, TIMER_UPDATE, INITIAL_UPDATE_DELAY_MS, None);
         }
         if sync_on_start
             && !STATE
@@ -318,6 +328,7 @@ fn win32_loop(show_on_start: bool, sync_on_start: bool) -> super::AppResult<()> 
                 .expect("tray state")
                 .setup_mode
                 .load(Ordering::Acquire)
+            && initial_sync_is_due()
         {
             SetTimer(hwnd, TIMER_INITIAL, 1_000, None);
         }
@@ -641,7 +652,9 @@ fn handle_timer(hwnd: HWND, timer: usize) {
         {
             request_sync(false, false);
         }
-        invalidate();
+        if unsafe { IsWindowVisible(hwnd) } != 0 {
+            invalidate();
+        }
     } else if timer == TIMER_UPDATE {
         unsafe { KillTimer(hwnd, TIMER_UPDATE) };
         request_update();
@@ -781,6 +794,9 @@ fn create_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
 
 fn show_dashboard(hwnd: HWND) {
     let state = STATE.get().expect("tray state");
+    if !state.counts_loaded.load(Ordering::Acquire) {
+        refresh_counts();
+    }
     unsafe {
         refresh_controls();
         if !state.positioned.swap(true, Ordering::AcqRel) {
@@ -1091,6 +1107,7 @@ fn setup_google(hwnd: HWND) {
     }
     let state = STATE.get().expect("tray state").clone();
     state.progress.begin();
+    refresh_animation_timer();
     set_message("Google-Anmeldung", "Der Browser wird geöffnet");
     let selected = if embedded_oauth_client().is_none() {
         choose_json_file(hwnd)
@@ -1099,6 +1116,7 @@ fn setup_google(hwnd: HWND) {
     };
     if embedded_oauth_client().is_none() && selected.is_none() {
         state.working.store(false, Ordering::Release);
+        refresh_animation_timer();
         return;
     }
     thread::spawn(move || {
@@ -1132,6 +1150,8 @@ fn setup_takeout(hwnd: HWND) {
     if state.working.swap(true, Ordering::AcqRel) {
         return;
     }
+    state.progress.begin();
+    refresh_animation_timer();
     set_message(
         "Takeout wird eingelesen",
         "Bestehende Inhalte werden lokal erkannt",
@@ -1245,6 +1265,8 @@ fn disconnect_google_account(hwnd: HWND) {
     if state.working.swap(true, Ordering::AcqRel) {
         return;
     }
+    state.progress.begin();
+    refresh_animation_timer();
     set_message("Google wird getrennt", "Der Zugriff wird sicher widerrufen");
     thread::spawn(move || {
         let result = disconnect_google(&state.paths);
@@ -1264,6 +1286,7 @@ fn disconnect_google_account(hwnd: HWND) {
 fn finish_background_work(kind: usize) {
     let state = STATE.get().expect("tray state");
     state.working.store(false, Ordering::Release);
+    refresh_animation_timer();
     if kind == WORK_UPDATE && state.auto_update.load(Ordering::Acquire) {
         unsafe {
             SetTimer(
@@ -1510,6 +1533,7 @@ fn request_update() {
         return;
     }
     state.progress.begin();
+    refresh_animation_timer();
     set_message(
         "Suche Aktualisierung",
         "Die GitHub-Veröffentlichungen werden geprüft",
@@ -1918,6 +1942,8 @@ fn request_sync(manual: bool, dry_run: bool) {
         return;
     }
     state.dry_run.store(dry_run, Ordering::Release);
+    state.progress.begin();
+    refresh_animation_timer();
     set_message(
         if dry_run {
             "Testlauf l\u{00e4}uft"
@@ -1952,6 +1978,7 @@ fn request_sync(manual: bool, dry_run: bool) {
                 .store(next_due_time(&all_sources), Ordering::Release);
             state.syncing.store(false, Ordering::Release);
             state.dry_run.store(false, Ordering::Release);
+            refresh_animation_timer();
             return;
         }
         let mut paths = state.paths.clone();
@@ -1984,6 +2011,7 @@ fn request_sync(manual: bool, dry_run: bool) {
         let current_sources = state.sources.lock().expect("source state").clone();
         let refreshed =
             counts(&state.paths, &current_sources).unwrap_or((0, current_sources.len(), 0));
+        state.counts_loaded.store(true, Ordering::Release);
         if let Ok(mut view) = state.view.lock() {
             view.protected = refreshed.0;
             view.folders = refreshed.1;
@@ -2022,6 +2050,7 @@ fn request_sync(manual: bool, dry_run: bool) {
             .store(next_due_time(&current_sources), Ordering::Release);
         state.syncing.store(false, Ordering::Release);
         state.dry_run.store(false, Ordering::Release);
+        refresh_animation_timer();
         refresh_controls();
         invalidate();
     });
@@ -2179,6 +2208,7 @@ fn refresh_counts() {
         view.protected = protected;
         view.folders = folders;
         view.pending = pending;
+        state.counts_loaded.store(true, Ordering::Release);
     }
     invalidate();
 }
@@ -2243,6 +2273,31 @@ fn next_due_time(sources: &[SourceSpec]) -> i64 {
         .max(now)
 }
 
+fn initial_sync_is_due() -> bool {
+    STATE
+        .get()
+        .is_some_and(|state| sync_is_due_at(state.next_run.load(Ordering::Acquire), unix_seconds()))
+}
+
+fn sync_is_due_at(next_run: i64, now: i64) -> bool {
+    next_run <= now + 1
+}
+
+fn refresh_animation_timer() {
+    let Some(state) = STATE.get() else { return };
+    let hwnd = state.hwnd.load(Ordering::Acquire) as HWND;
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if state.syncing.load(Ordering::Acquire) || state.working.load(Ordering::Acquire) {
+            SetTimer(hwnd, TIMER_ANIMATION, ANIMATION_INTERVAL_MS, None);
+        } else {
+            KillTimer(hwnd, TIMER_ANIMATION);
+        }
+    }
+}
+
 fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * KB;
@@ -2267,7 +2322,7 @@ fn read_control_text(hwnd: HWND) -> String {
 fn invalidate() {
     if let Some(state) = STATE.get() {
         let raw = state.hwnd.load(Ordering::Acquire);
-        if raw != 0 {
+        if raw != 0 && unsafe { IsWindowVisible(raw as HWND) } != 0 {
             unsafe { InvalidateRect(raw as HWND, null(), 0) };
         }
     }
@@ -2335,4 +2390,17 @@ fn copy_wide(target: &mut [u16], value: &str) {
     let encoded = wide(value);
     let length = encoded.len().min(target.len());
     target[..length].copy_from_slice(&encoded[..length]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync_is_due_at;
+
+    #[test]
+    fn startup_sync_only_runs_when_a_folder_is_due() {
+        assert!(sync_is_due_at(1_000, 1_000));
+        assert!(sync_is_due_at(1_001, 1_000));
+        assert!(!sync_is_due_at(1_002, 1_000));
+        assert!(!sync_is_due_at(1_900, 1_000));
+    }
 }
