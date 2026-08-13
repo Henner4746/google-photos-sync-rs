@@ -20,7 +20,7 @@ Do not add an `A` or `AAAA` record for the same hostname.
 
 ## GitHub Pages
 
-After DNS resolves, add a `docs/CNAME` file containing only `photos-sync.henrik.click`, push it, then open repository settings for `Henner4746/google-photos-sync-rs`, Pages, and set the custom domain to:
+The repository already contains a `docs/CNAME` file with `photos-sync.henrik.click`. After DNS resolves, open repository settings for `Henner4746/google-photos-sync-rs`, Pages, and confirm the custom domain is:
 
 `photos-sync.henrik.click`
 
