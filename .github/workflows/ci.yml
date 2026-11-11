@@ -48,6 +48,15 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+      # Unsigned test build for maintainers; public releases come only from
+      # the signed release workflow.
+      - name: Keep unsigned test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gphotos-sync-unsigned-${{ github.sha }}
+          path: target/release/gphotos-sync.exe
+          if-no-files-found: error
+          retention-days: 7
       - name: Compile Windows installer
         shell: pwsh
         run: |
