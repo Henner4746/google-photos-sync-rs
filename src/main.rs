@@ -10,7 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, c_void};
@@ -1286,6 +1286,55 @@ impl GoogleClient {
         if let Some(album_id) = self.find_album(title)? {
             return Ok(album_id);
         }
+        self.create_album(title)
+    }
+
+    /// All albums this app created, by title. The first album wins when
+    /// several share a title.
+    fn list_albums(&mut self) -> AppResult<HashMap<String, String>> {
+        let mut result = HashMap::new();
+        let mut page_token = String::new();
+        loop {
+            let mut query = vec![("pageSize".to_owned(), "50".to_owned())];
+            if !page_token.is_empty() {
+                query.push(("pageToken".to_owned(), page_token.clone()));
+            }
+            let value =
+                self.json_request(Method::GET, &format!("{GOOGLE_API}/albums"), &query, None)?;
+            if let Some(albums) = value.get("albums").and_then(Value::as_array) {
+                for album in albums {
+                    let title = album.get("title").and_then(Value::as_str);
+                    let id = album.get("id").and_then(Value::as_str);
+                    if let (Some(title), Some(id)) = (title, id) {
+                        result
+                            .entry(title.to_owned())
+                            .or_insert_with(|| id.to_owned());
+                    }
+                }
+            }
+            page_token = value
+                .get("nextPageToken")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            if page_token.is_empty() {
+                return Ok(result);
+            }
+        }
+    }
+
+    fn add_to_album(&mut self, album_id: &str, media_ids: &[String]) -> AppResult<()> {
+        let body = json!({ "mediaItemIds": media_ids });
+        self.json_request(
+            Method::POST,
+            &format!("{GOOGLE_API}/albums/{album_id}:batchAddMediaItems"),
+            &[],
+            Some(&body),
+        )?;
+        Ok(())
+    }
+
+    fn create_album(&mut self, title: &str) -> AppResult<String> {
         let body = json!({ "album": { "title": title } });
         let value = self.json_request(
             Method::POST,
@@ -1508,23 +1557,20 @@ fn sync(
             );
             total.scanned += stats.scanned;
             total.unchanged += stats.unchanged;
+            sort_into_month_albums_logged(&database, &mut google, paths, logger, source, dry_run);
             continue;
         }
-        if google.is_none() {
-            let credentials = load_credentials(&paths.credentials)?;
-            google = Some(GoogleClient::connect(credentials)?);
-        }
-        let google = google.as_mut().expect("Google client initialized");
+        let client = connected_google(&mut google, paths)?;
         logger.log("INFO", format!("Pruefe Album {}", source.album));
         let album_id = if options.dry_run {
-            google.find_album(&source.album)?.unwrap_or_default()
+            client.find_album(&source.album)?.unwrap_or_default()
         } else {
-            google.find_or_create_album(&source.album)?
+            client.find_or_create_album(&source.album)?
         };
         let remote = if album_id.is_empty() {
             HashMap::new()
         } else {
-            google.album_media(&album_id)?
+            client.album_media(&album_id)?
         };
         logger.log(
             "INFO",
@@ -1536,7 +1582,7 @@ fn sync(
         );
         let stats = sync_source(
             &mut database,
-            google,
+            client,
             logger,
             source,
             &album_id,
@@ -1544,6 +1590,7 @@ fn sync(
             options,
             progress.as_ref(),
         )?;
+        sort_into_month_albums_logged(&database, &mut google, paths, logger, source, dry_run);
         logger.log(
             "ERGEBNIS",
             format!(
@@ -1582,6 +1629,225 @@ fn sync(
         return Err(format!("{} Datei(en) konnten nicht gesichert werden.", total.failed).into());
     }
     Ok(())
+}
+
+fn connected_google<'a>(
+    google: &'a mut Option<GoogleClient>,
+    paths: &AppPaths,
+) -> AppResult<&'a mut GoogleClient> {
+    if google.is_none() {
+        let credentials = load_credentials(&paths.credentials)?;
+        *google = Some(GoogleClient::connect(credentials)?);
+    }
+    Ok(google.as_mut().expect("Google client initialized"))
+}
+
+/// Monthly albums are a convenience on top of the backup: a failure here is
+/// logged and retried on the next run, but never fails the upload itself.
+fn sort_into_month_albums_logged(
+    database: &Connection,
+    google: &mut Option<GoogleClient>,
+    paths: &AppPaths,
+    logger: &Logger,
+    source: &SourceSpec,
+    dry_run: bool,
+) {
+    if let Err(error) = sort_into_month_albums(database, google, paths, logger, source, dry_run) {
+        logger.log(
+            "WARN",
+            format!("Monatsalben fuer {}: {error}", source.album),
+        );
+    }
+}
+
+/// Adds every confirmed item of a source to an album such as
+/// "Screenshots 2026-11", in addition to the source album. Items are only
+/// added, never uploaded again; the database remembers what is sorted, so
+/// a fully sorted source needs no network access.
+fn sort_into_month_albums(
+    database: &Connection,
+    google: &mut Option<GoogleClient>,
+    paths: &AppPaths,
+    logger: &Logger,
+    source: &SourceSpec,
+    dry_run: bool,
+) -> AppResult<()> {
+    let pending = pending_month_items(database, &source.album)?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if dry_run {
+        for (title, media_ids) in &pending {
+            logger.log(
+                "TEST",
+                format!(
+                    "Wuerde einsortieren: {} Eintraege -> {title}",
+                    media_ids.len()
+                ),
+            );
+        }
+        return Ok(());
+    }
+    let client = connected_google(google, paths)?;
+    let mut albums = client.list_albums()?;
+    for (title, media_ids) in pending {
+        let album_id = match albums.get(&title) {
+            Some(album_id) => album_id.clone(),
+            None => {
+                let album_id = client.create_album(&title)?;
+                albums.insert(title.clone(), album_id.clone());
+                album_id
+            }
+        };
+        let mut added = 0;
+        for chunk in media_ids.chunks(50) {
+            client.ensure_fresh_access_token()?;
+            if client.add_to_album(&album_id, chunk).is_ok() {
+                record_month_items(database, &source.album, &title, chunk, "added")?;
+                added += chunk.len();
+                continue;
+            }
+            // Google rejects the whole batch when a single item is gone, for
+            // example after it was deleted in Google Photos. Retry one by one.
+            let mut rejected = Vec::new();
+            for media_id in chunk {
+                let single = std::slice::from_ref(media_id);
+                match client.add_to_album(&album_id, single) {
+                    Ok(()) => {
+                        record_month_items(database, &source.album, &title, single, "added")?;
+                        added += 1;
+                    }
+                    Err(error) => rejected.push((media_id, error.to_string())),
+                }
+            }
+            if rejected.len() == chunk.len() {
+                // Nothing went through: most likely a temporary problem.
+                // Leave everything pending for the next run.
+                logger.log("MONATSALBUM", format!("{title}: {added} einsortiert"));
+                return Err(format!(
+                    "{title} gerade nicht erreichbar ({}), naechster Lauf versucht es erneut",
+                    rejected[0].1
+                )
+                .into());
+            }
+            for (media_id, error) in rejected {
+                let single = std::slice::from_ref(media_id);
+                record_month_items(database, &source.album, &title, single, "rejected")?;
+                logger.log(
+                    "WARN",
+                    format!("{title}: Eintrag {media_id} nicht einsortiert: {error}"),
+                );
+            }
+        }
+        logger.log("MONATSALBUM", format!("{title}: {added} einsortiert"));
+    }
+    Ok(())
+}
+
+/// Confirmed Google items of a source that are not yet in a monthly album,
+/// grouped by album title. Content duplicates share one Google item, which
+/// is sorted by its oldest local file.
+fn pending_month_items(
+    database: &Connection,
+    source_album: &str,
+) -> AppResult<BTreeMap<String, Vec<String>>> {
+    let mut statement = database.prepare(
+        "SELECT media_id, MIN(mtime_ns) FROM media
+         WHERE album = ?1
+           AND media_id <> ''
+           AND state IN ('uploaded', 'remote-existing', 'content-duplicate')
+           AND media_id NOT IN (
+               SELECT media_id FROM month_album_items WHERE source_album = ?1
+           )
+         GROUP BY media_id
+         ORDER BY MIN(mtime_ns), media_id",
+    )?;
+    let rows = statement.query_map(params![source_album], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })?;
+    let mut pending: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for row in rows {
+        let (media_id, mtime_ns) = row?;
+        pending
+            .entry(month_album_title(source_album, mtime_ns))
+            .or_default()
+            .push(media_id);
+    }
+    Ok(pending)
+}
+
+fn record_month_items(
+    database: &Connection,
+    source_album: &str,
+    month_album: &str,
+    media_ids: &[String],
+    state: &str,
+) -> AppResult<()> {
+    let now = unix_seconds();
+    for media_id in media_ids {
+        database.execute(
+            "INSERT INTO month_album_items(source_album, media_id, month_album, state, updated_at)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(source_album, media_id) DO UPDATE SET
+               month_album = excluded.month_album,
+               state = excluded.state,
+               updated_at = excluded.updated_at",
+            params![source_album, media_id, month_album, state, now],
+        )?;
+    }
+    Ok(())
+}
+
+fn month_album_title(source_album: &str, unix_ns: i64) -> String {
+    let (year, month) = local_year_month(unix_ns);
+    format!("{source_album} {year:04}-{month:02}")
+}
+
+/// Year and month of a file time in the Windows local time zone, including
+/// the daylight saving rule that applied on that date.
+fn local_year_month(unix_ns: i64) -> (i32, u32) {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+    const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+    let ticks = unix_ns
+        .div_euclid(100)
+        .saturating_add(UNIX_EPOCH_AS_FILETIME)
+        .max(0) as u64;
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let mut utc: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let mut local: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    let converted = unsafe {
+        FileTimeToSystemTime(&file_time, &mut utc) != 0
+            && SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) != 0
+    };
+    if converted {
+        (i32::from(local.wYear), u32::from(local.wMonth))
+    } else {
+        utc_year_month(unix_ns)
+    }
+}
+
+/// Civil year and month in UTC (proleptic Gregorian calendar).
+fn utc_year_month(unix_ns: i64) -> (i32, u32) {
+    let days = unix_ns.div_euclid(86_400_000_000_000);
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year as i32, month as u32)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1877,8 +2143,15 @@ fn open_database(path: &Path) -> AppResult<Connection> {
     let connection = Connection::open(path)?;
     connection.execute_batch(
         "PRAGMA journal_mode=WAL;
-         PRAGMA synchronous=NORMAL;
-         CREATE TABLE IF NOT EXISTS media (
+         PRAGMA synchronous=NORMAL;",
+    )?;
+    create_schema(&connection)?;
+    Ok(connection)
+}
+
+fn create_schema(connection: &Connection) -> AppResult<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS media (
              album TEXT NOT NULL,
              path TEXT NOT NULL,
              size INTEGER NOT NULL,
@@ -1896,9 +2169,17 @@ fn open_database(path: &Path) -> AppResult<Connection> {
              sha256 TEXT PRIMARY KEY,
              source TEXT NOT NULL,
              imported_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS month_album_items (
+             source_album TEXT NOT NULL,
+             media_id TEXT NOT NULL,
+             month_album TEXT NOT NULL,
+             state TEXT NOT NULL,
+             updated_at INTEGER NOT NULL,
+             PRIMARY KEY (source_album, media_id)
          );",
     )?;
-    Ok(connection)
+    Ok(())
 }
 
 fn fully_known_source(
@@ -2488,6 +2769,133 @@ mod tests {
         assert!(error.contains("keine gültige Sicherung"));
         assert_eq!(fs::read(&path).unwrap(), vec![0_u8; 16]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    const NOV_15_2026_NOON_NS: i64 = 1_794_744_000 * 1_000_000_000;
+    const OCT_10_2026_NOON_NS: i64 = 1_791_633_600 * 1_000_000_000;
+
+    #[test]
+    fn utc_months_follow_the_calendar() {
+        assert_eq!(utc_year_month(0), (1970, 1));
+        assert_eq!(utc_year_month(-1), (1969, 12));
+        assert_eq!(utc_year_month(1_709_208_000 * 1_000_000_000), (2024, 2));
+        assert_eq!(utc_year_month(1_772_323_200 * 1_000_000_000), (2026, 3));
+        assert_eq!(utc_year_month(NOV_15_2026_NOON_NS), (2026, 11));
+        assert_eq!(utc_year_month(OCT_10_2026_NOON_NS), (2026, 10));
+    }
+
+    #[test]
+    fn month_album_titles_use_year_and_month() {
+        // Mid-month noon is the same month in every time zone.
+        assert_eq!(
+            month_album_title("Screenshots", NOV_15_2026_NOON_NS),
+            "Screenshots 2026-11"
+        );
+        assert_eq!(
+            month_album_title("AMD-Clips", OCT_10_2026_NOON_NS),
+            "AMD-Clips 2026-10"
+        );
+    }
+
+    #[test]
+    fn pending_month_items_skip_sorted_foreign_and_unconfirmed_items() {
+        let connection = Connection::open_in_memory().unwrap();
+        create_schema(&connection).unwrap();
+        let rows: [(&str, &str, i64, &str, &str); 7] = [
+            (
+                "Screenshots",
+                "a.png",
+                NOV_15_2026_NOON_NS,
+                "id-shared",
+                "uploaded",
+            ),
+            (
+                "Screenshots",
+                "a-copy.png",
+                OCT_10_2026_NOON_NS,
+                "id-shared",
+                "content-duplicate",
+            ),
+            (
+                "Screenshots",
+                "b.png",
+                NOV_15_2026_NOON_NS,
+                "id-b",
+                "uploaded",
+            ),
+            (
+                "Screenshots",
+                "c.png",
+                NOV_15_2026_NOON_NS,
+                "",
+                "takeout-existing",
+            ),
+            (
+                "Screenshots",
+                "d.png",
+                NOV_15_2026_NOON_NS,
+                "id-d",
+                "uploaded",
+            ),
+            (
+                "Screenshots",
+                "f.png",
+                NOV_15_2026_NOON_NS,
+                "id-f",
+                "pending",
+            ),
+            (
+                "AMD-Clips",
+                "e.mp4",
+                NOV_15_2026_NOON_NS,
+                "id-e",
+                "uploaded",
+            ),
+        ];
+        for (album, path, mtime_ns, media_id, state) in rows {
+            connection
+                .execute(
+                    "INSERT INTO media VALUES(?1, ?2, 1, ?3, 'hash', 'name', ?4, ?5, 1)",
+                    params![album, path, mtime_ns, media_id, state],
+                )
+                .unwrap();
+        }
+        record_month_items(
+            &connection,
+            "Screenshots",
+            "Screenshots 2026-11",
+            &["id-d".to_owned()],
+            "added",
+        )
+        .unwrap();
+
+        let pending = pending_month_items(&connection, "Screenshots").unwrap();
+        let expected: BTreeMap<String, Vec<String>> = BTreeMap::from([
+            (
+                "Screenshots 2026-10".to_owned(),
+                vec!["id-shared".to_owned()],
+            ),
+            ("Screenshots 2026-11".to_owned(), vec!["id-b".to_owned()]),
+        ]);
+        assert_eq!(pending, expected);
+
+        record_month_items(
+            &connection,
+            "Screenshots",
+            "Screenshots 2026-11",
+            &["id-b".to_owned(), "id-shared".to_owned()],
+            "added",
+        )
+        .unwrap();
+        assert!(
+            pending_month_items(&connection, "Screenshots")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            pending_month_items(&connection, "AMD-Clips").unwrap().len(),
+            1
+        );
     }
 
     #[test]

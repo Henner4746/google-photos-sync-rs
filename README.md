@@ -25,6 +25,7 @@ Google Photos Sync stays quietly in the Windows notification area. Its monochrom
 - **Google-side recovery.** Content-addressed filenames reconcile media that this same app can see in Google Photos.
 - **Takeout protection.** A local Takeout scan records hashes for older Google Photos items the API can no longer expose. Setup warns before proceeding without it, and real uploads stay blocked until Takeout was imported or the user explicitly confirms that no older copies from the selected folders exist.
 - **Per-folder controls.** Each folder has its own album, media type, enabled state, schedule, and excluded subfolders.
+- **Monthly albums.** Each item is also added to an album such as `Screenshots 2026-11`, based on the file's local modification month. Items uploaded by earlier versions are sorted in once without being uploaded again.
 - **Visible work.** Uploads show file progress and transfer speed; errors produce a Windows notification.
 - **Network recovery.** Upload and API calls retry transient failures with backoff. Anything not confirmed remains pending and resumes on the next run.
 - **Persistent state.** Paused state, schedules, window position, and last successful runs survive restarts.
