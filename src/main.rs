@@ -575,10 +575,46 @@ fn write_example_config(path: &Path) -> AppResult<()> {
         takeout_imported_at: None,
         takeout_not_required_confirmed: false,
     };
+    write_config_atomically(path, &config)
+}
+
+fn sibling_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn config_backup_path(path: &Path) -> PathBuf {
+    sibling_path(path, ".bak")
+}
+
+fn parse_config(path: &Path) -> AppResult<AppConfig> {
+    let mut config: AppConfig = serde_json::from_slice(&fs::read(path)?)?;
+    for source in &mut config.sources {
+        source.schedule_minutes = source.schedule_minutes.max(MIN_SCHEDULE_MINUTES);
+    }
+    Ok(config)
+}
+
+/// Replaces the configuration so that a crash or power loss leaves either the
+/// old or the new file, never a truncated or zero-filled one. The previous
+/// valid configuration is kept as `.bak` for recovery.
+fn write_config_atomically(path: &Path, config: &AppConfig) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(&config)?)?;
+    let temporary = sibling_path(path, ".tmp");
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(&serde_json::to_vec_pretty(config)?)?;
+        file.sync_all()?;
+    }
+    if parse_config(path).is_ok() {
+        let backup = config_backup_path(path);
+        fs::copy(path, &backup)?;
+        OpenOptions::new().write(true).open(&backup)?.sync_all()?;
+    }
+    fs::rename(&temporary, path)?;
     Ok(())
 }
 
@@ -594,9 +630,6 @@ fn save_config(
     takeout_imported_at: Option<i64>,
     takeout_not_required_confirmed: bool,
 ) -> AppResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let config = AppConfig {
         sources: sources.to_vec(),
         window_x: window_position.map(|position| position.0),
@@ -608,20 +641,33 @@ fn save_config(
         takeout_imported_at,
         takeout_not_required_confirmed,
     };
-    fs::write(path, serde_json::to_vec_pretty(&config)?)?;
-    Ok(())
+    write_config_atomically(path, &config)
 }
 
 fn load_or_create_config(path: &Path) -> AppResult<AppConfig> {
-    if path.is_file() {
-        let mut config: AppConfig = serde_json::from_slice(&fs::read(path)?)?;
-        for source in &mut config.sources {
-            source.schedule_minutes = source.schedule_minutes.max(MIN_SCHEDULE_MINUTES);
-        }
-        return Ok(config);
+    if !path.is_file() {
+        write_example_config(path)?;
+        return parse_config(path);
     }
-    write_example_config(path)?;
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    let error = match parse_config(path) {
+        Ok(config) => return Ok(config),
+        Err(error) => error,
+    };
+    // A crash or power loss during an older non-atomic save can leave a
+    // zero-filled file. Recover from the last valid copy instead of refusing
+    // to start, and keep the damaged file for diagnosis.
+    match parse_config(&config_backup_path(path)) {
+        Ok(config) => {
+            let _ = fs::copy(path, sibling_path(path, ".damaged"));
+            write_config_atomically(path, &config)?;
+            Ok(config)
+        }
+        Err(_) => Err(format!(
+            "Die Konfiguration {} ist beschädigt ({error}) und es gibt keine gültige Sicherung.",
+            path.display()
+        )
+        .into()),
+    }
 }
 
 fn duplicate_guard_ready(
@@ -2380,6 +2426,68 @@ mod tests {
         assert!(!duplicate_guard_ready(Some(0), false));
         assert!(duplicate_guard_ready(Some(99), false));
         assert!(duplicate_guard_ready(None, true));
+    }
+
+    fn config_test_root(name: &str) -> PathBuf {
+        let root = env::temp_dir().join(format!(
+            "gphotos-config-{name}-{}-{}",
+            std::process::id(),
+            unix_seconds()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn save_test_config(path: &Path, album: &str) {
+        let source = SourceSpec {
+            album: album.to_owned(),
+            path: PathBuf::from(r"D:\Media"),
+            kind: MediaKind::Images,
+            enabled: true,
+            schedule_minutes: DEFAULT_SCHEDULE_MINUTES,
+            excluded_subfolders: Vec::new(),
+            last_successful_sync: 0,
+        };
+        save_config(path, &[source], None, false, true, true, true, None, true).unwrap();
+    }
+
+    #[test]
+    fn zero_filled_config_is_recovered_from_backup() {
+        let root = config_test_root("recover");
+        let path = root.join("gphotos-sync.json");
+        save_test_config(&path, "Erste");
+        assert!(!config_backup_path(&path).exists());
+        save_test_config(&path, "Zweite");
+        assert!(!sibling_path(&path, ".tmp").exists());
+        assert_eq!(
+            parse_config(&config_backup_path(&path)).unwrap().sources[0].album,
+            "Erste"
+        );
+
+        // What a power loss during a non-atomic write left behind.
+        fs::write(&path, vec![0_u8; 713]).unwrap();
+        let recovered = load_or_create_config(&path).unwrap();
+        assert_eq!(recovered.sources[0].album, "Erste");
+        assert!(recovered.onboarding_completed);
+        assert_eq!(parse_config(&path).unwrap().sources[0].album, "Erste");
+        assert_eq!(
+            fs::read(sibling_path(&path, ".damaged")).unwrap(),
+            vec![0_u8; 713]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn damaged_config_without_backup_names_the_file() {
+        let root = config_test_root("nobackup");
+        let path = root.join("gphotos-sync.json");
+        fs::write(&path, vec![0_u8; 16]).unwrap();
+        let error = load_or_create_config(&path).unwrap_err().to_string();
+        assert!(error.contains("gphotos-sync.json"));
+        assert!(error.contains("keine gültige Sicherung"));
+        assert_eq!(fs::read(&path).unwrap(), vec![0_u8; 16]);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
