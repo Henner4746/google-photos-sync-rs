@@ -1239,11 +1239,10 @@ impl GoogleClient {
             let status = response.status();
             let value: Value = response.json()?;
             if !status.is_success() {
-                return Err(format!(
-                    "Google Photos API ({status}): {}",
-                    safe_google_error(&value)
-                )
-                .into());
+                return Err(Box::new(GoogleApiError {
+                    status,
+                    message: safe_google_error(&value),
+                }));
             }
             return Ok(value);
         }
@@ -1689,8 +1688,32 @@ fn sort_into_month_albums(
         return Ok(());
     }
     let client = connected_google(google, paths)?;
+    // The Library API only lets an app add items it created itself with the
+    // same OAuth client. Items uploaded by an older client, or deleted in
+    // Google Photos since, are not visible here and are skipped for good
+    // without a request per item.
+    let visible: HashSet<String> = match client.find_album(&source.album)? {
+        Some(album_id) => client.album_media(&album_id)?.into_values().collect(),
+        None => HashSet::new(),
+    };
     let mut albums = client.list_albums()?;
     for (title, media_ids) in pending {
+        let (sortable, hidden): (Vec<String>, Vec<String>) = media_ids
+            .into_iter()
+            .partition(|media_id| visible.contains(media_id));
+        if !hidden.is_empty() {
+            record_month_items(database, &source.album, &title, &hidden, "not-visible")?;
+            logger.log(
+                "MONATSALBUM",
+                format!(
+                    "{title}: {} Eintraege uebersprungen (nicht von diesem Zugang hochgeladen oder in Google Fotos geloescht)",
+                    hidden.len()
+                ),
+            );
+        }
+        if sortable.is_empty() {
+            continue;
+        }
         let album_id = match albums.get(&title) {
             Some(album_id) => album_id.clone(),
             None => {
@@ -1700,16 +1723,23 @@ fn sort_into_month_albums(
             }
         };
         let mut added = 0;
-        for chunk in media_ids.chunks(50) {
+        let mut rejected = 0;
+        for chunk in sortable.chunks(50) {
             client.ensure_fresh_access_token()?;
-            if client.add_to_album(&album_id, chunk).is_ok() {
-                record_month_items(database, &source.album, &title, chunk, "added")?;
-                added += chunk.len();
-                continue;
+            let batch_error = match client.add_to_album(&album_id, chunk) {
+                Ok(()) => {
+                    record_month_items(database, &source.album, &title, chunk, "added")?;
+                    added += chunk.len();
+                    continue;
+                }
+                Err(error) => error,
+            };
+            if !is_permanent_rejection(batch_error.as_ref()) {
+                logger.log("MONATSALBUM", format!("{title}: {added} einsortiert"));
+                return Err(batch_error);
             }
-            // Google rejects the whole batch when a single item is gone, for
-            // example after it was deleted in Google Photos. Retry one by one.
-            let mut rejected = Vec::new();
+            // Google rejects the whole batch when a single item is invalid.
+            // Retry one by one so the valid items still get sorted.
             for media_id in chunk {
                 let single = std::slice::from_ref(media_id);
                 match client.add_to_album(&album_id, single) {
@@ -1717,32 +1747,56 @@ fn sort_into_month_albums(
                         record_month_items(database, &source.album, &title, single, "added")?;
                         added += 1;
                     }
-                    Err(error) => rejected.push((media_id, error.to_string())),
+                    Err(error) if is_permanent_rejection(error.as_ref()) => {
+                        record_month_items(database, &source.album, &title, single, "rejected")?;
+                        rejected += 1;
+                    }
+                    Err(error) => {
+                        // Temporary problem: keep the rest pending for the
+                        // next run.
+                        logger.log("MONATSALBUM", format!("{title}: {added} einsortiert"));
+                        return Err(error);
+                    }
                 }
             }
-            if rejected.len() == chunk.len() {
-                // Nothing went through: most likely a temporary problem.
-                // Leave everything pending for the next run.
-                logger.log("MONATSALBUM", format!("{title}: {added} einsortiert"));
-                return Err(format!(
-                    "{title} gerade nicht erreichbar ({}), naechster Lauf versucht es erneut",
-                    rejected[0].1
-                )
-                .into());
-            }
-            for (media_id, error) in rejected {
-                let single = std::slice::from_ref(media_id);
-                record_month_items(database, &source.album, &title, single, "rejected")?;
-                logger.log(
-                    "WARN",
-                    format!("{title}: Eintrag {media_id} nicht einsortiert: {error}"),
-                );
-            }
+        }
+        if rejected > 0 {
+            logger.log(
+                "WARN",
+                format!("{title}: {rejected} Eintraege von Google abgelehnt"),
+            );
         }
         logger.log("MONATSALBUM", format!("{title}: {added} einsortiert"));
     }
     Ok(())
 }
+
+/// A request Google refused for good, such as an unknown or foreign media
+/// item. Network problems, rate limits and server errors are retried by
+/// `json_request` and count as temporary.
+fn is_permanent_rejection(error: &(dyn Error + Send + Sync + 'static)) -> bool {
+    error
+        .downcast_ref::<GoogleApiError>()
+        .is_some_and(|error| error.status.is_client_error() && error.status.as_u16() != 429)
+}
+
+#[derive(Debug)]
+struct GoogleApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl std::fmt::Display for GoogleApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Google Photos API ({}): {}",
+            self.status, self.message
+        )
+    }
+}
+
+impl Error for GoogleApiError {}
 
 /// Confirmed Google items of a source that are not yet in a monthly album,
 /// grouped by album title. Content duplicates share one Google item, which
@@ -2896,6 +2950,30 @@ mod tests {
             pending_month_items(&connection, "AMD-Clips").unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn only_client_errors_are_permanent_rejections() {
+        let api_error = |status| -> Box<dyn Error + Send + Sync> {
+            Box::new(GoogleApiError {
+                status,
+                message: "invalid media item id".to_owned(),
+            })
+        };
+        let rejected = api_error(StatusCode::BAD_REQUEST);
+        assert!(is_permanent_rejection(rejected.as_ref()));
+        assert_eq!(
+            rejected.to_string(),
+            "Google Photos API (400 Bad Request): invalid media item id"
+        );
+        assert!(!is_permanent_rejection(
+            api_error(StatusCode::TOO_MANY_REQUESTS).as_ref()
+        ));
+        assert!(!is_permanent_rejection(
+            api_error(StatusCode::INTERNAL_SERVER_ERROR).as_ref()
+        ));
+        let network: Box<dyn Error + Send + Sync> = "Netzwerk weg".into();
+        assert!(!is_permanent_rejection(network.as_ref()));
     }
 
     #[test]
