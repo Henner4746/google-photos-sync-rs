@@ -72,6 +72,7 @@ const TIMER_UPDATE: usize = 4;
 const SCHEDULE_INTERVAL_MS: u32 = 60_000;
 const ANIMATION_INTERVAL_MS: u32 = 250;
 const INITIAL_UPDATE_DELAY_MS: u32 = 60_000;
+const UPDATE_RETRY_MS: u32 = 3 * 60 * 60 * 1_000;
 const UPDATE_INTERVAL_MS: u32 = 24 * 60 * 60 * 1_000;
 const CMD_OPEN: usize = 1001;
 const CMD_SYNC: usize = 1002;
@@ -182,6 +183,7 @@ struct TrayState {
     working: AtomicBool,
     pending_error: Mutex<Option<String>>,
     pending_update: Mutex<Option<PathBuf>>,
+    update_deferred: AtomicBool,
     settings_mode: AtomicBool,
     counts_loaded: AtomicBool,
 }
@@ -190,6 +192,39 @@ struct TrayState {
 struct UpdateWorkerResult {
     helper: Option<PathBuf>,
     error: Option<String>,
+    /// GitHub was unreachable or rate limited; nothing the user must fix.
+    #[serde(default)]
+    temporary: bool,
+}
+
+/// An update check that failed for a reason outside the user's control,
+/// such as GitHub's limit of 60 anonymous API requests per hour, which all
+/// devices behind one internet connection share.
+#[derive(Debug)]
+struct TemporaryUpdateError(String);
+
+impl std::fmt::Display for TemporaryUpdateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TemporaryUpdateError {}
+
+fn temporary_update_error(message: String) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(TemporaryUpdateError(message))
+}
+
+fn is_temporary_update_error(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<TemporaryUpdateError>().is_some()
+}
+
+fn github_unavailable(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (header("x-ratelimit-remaining") == Some("0") || header("retry-after").is_some()))
 }
 
 pub(super) fn run(
@@ -251,6 +286,7 @@ pub(super) fn run(
         working: AtomicBool::new(false),
         pending_error: Mutex::new(None),
         pending_update: Mutex::new(None),
+        update_deferred: AtomicBool::new(false),
         settings_mode: AtomicBool::new(false),
         counts_loaded: AtomicBool::new(load_initial_counts),
     });
@@ -664,7 +700,7 @@ fn handle_timer(hwnd: HWND, timer: usize) {
         }
     } else if timer == TIMER_UPDATE {
         unsafe { KillTimer(hwnd, TIMER_UPDATE) };
-        request_update();
+        request_update(true);
     } else if timer == TIMER_ANIMATION && {
         let state = STATE.get().expect("tray state");
         state.syncing.load(Ordering::Acquire) || state.working.load(Ordering::Acquire)
@@ -944,7 +980,7 @@ fn handle_command(hwnd: HWND, command: usize) {
         CMD_EXCLUDE => exclude_subfolder(hwnd),
         CMD_BACKUP => backup_database(hwnd),
         CMD_RESTORE => restore_database(hwnd),
-        CMD_UPDATE => request_update(),
+        CMD_UPDATE => request_update(false),
         CMD_DISCONNECT_GOOGLE => disconnect_google_account(hwnd),
         CMD_OPEN_LOG => open_path(hwnd, &STATE.get().expect("tray state").paths.log),
         CMD_OPEN_PHOTOS => open_target(hwnd, "https://photos.google.com/"),
@@ -1294,12 +1330,19 @@ fn finish_background_work(kind: usize) {
     let state = STATE.get().expect("tray state");
     state.working.store(false, Ordering::Release);
     refresh_animation_timer();
+    let update_deferred =
+        kind == WORK_UPDATE && state.update_deferred.swap(false, Ordering::AcqRel);
     if kind == WORK_UPDATE && state.auto_update.load(Ordering::Acquire) {
+        let interval = if update_deferred {
+            UPDATE_RETRY_MS
+        } else {
+            UPDATE_INTERVAL_MS
+        };
         unsafe {
             SetTimer(
                 state.hwnd.load(Ordering::Acquire) as HWND,
                 TIMER_UPDATE,
-                UPDATE_INTERVAL_MS,
+                interval,
                 None,
             );
         }
@@ -1352,7 +1395,14 @@ fn finish_background_work(kind: usize) {
             unsafe { DestroyWindow(state.hwnd.load(Ordering::Acquire) as HWND) };
             return;
         }
-        set_message("Alles aktuell", "Du verwendest bereits die neueste Version");
+        if update_deferred {
+            set_message(
+                "Aktualisierung später",
+                "GitHub war gerade nicht erreichbar, die Prüfung wird wiederholt",
+            );
+        } else {
+            set_message("Alles aktuell", "Du verwendest bereits die neueste Version");
+        }
     } else if kind == WORK_DISCONNECT {
         state.onboarding_completed.store(false, Ordering::Release);
         state.settings_mode.store(false, Ordering::Release);
@@ -1551,7 +1601,9 @@ fn restore_backup(paths: &AppPaths, source: &Path) -> super::AppResult<()> {
     Ok(())
 }
 
-fn request_update() {
+/// `automatic` checks stay silent when GitHub is only temporarily
+/// unavailable; a check the user started always reports the reason.
+fn request_update(automatic: bool) {
     let state = STATE.get().expect("tray state").clone();
     if state.working.swap(true, Ordering::AcqRel) {
         return;
@@ -1596,7 +1648,11 @@ fn request_update() {
         match result {
             Ok(outcome) => {
                 if let Some(error) = outcome.error {
-                    *state.pending_error.lock().expect("background result") = Some(error);
+                    if outcome.temporary && automatic {
+                        state.update_deferred.store(true, Ordering::Release);
+                    } else {
+                        *state.pending_error.lock().expect("background result") = Some(error);
+                    }
                 } else {
                     *state.pending_update.lock().expect("prepared update") = outcome.helper;
                 }
@@ -1639,10 +1695,12 @@ pub(super) fn run_update_worker(paths: &AppPaths, result_path: &Path) -> super::
         Ok(helper) => UpdateWorkerResult {
             helper,
             error: None,
+            temporary: false,
         },
         Err(error) => UpdateWorkerResult {
             helper: None,
             error: Some(error.to_string()),
+            temporary: is_temporary_update_error(error.as_ref()),
         },
     };
     let temporary = result_path.with_extension("tmp");
@@ -1661,9 +1719,16 @@ fn prepare_update(paths: &AppPaths) -> super::AppResult<Option<PathBuf>> {
         .build()?;
     let response = http
         .get("https://api.github.com/repos/Henner4746/google-photos-sync-rs/releases/latest")
-        .send()?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        .send()
+        .map_err(|error| temporary_update_error(format!("GitHub ist nicht erreichbar: {error}")))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
+    }
+    if github_unavailable(status, response.headers()) {
+        return Err(temporary_update_error(format!(
+            "GitHub begrenzt gerade die Abfragen ({status}). Die Prüfung wird später wiederholt."
+        )));
     }
     let release: serde_json::Value = response.error_for_status()?.json()?;
     let tag = release
@@ -2504,10 +2569,45 @@ mod tests {
                 r"C:\ProgramData\GooglePhotosSync\updates\signed.exe",
             )),
             error: None,
+            temporary: false,
         };
         let encoded = serde_json::to_vec(&expected).expect("serialize worker result");
         let decoded: UpdateWorkerResult =
             serde_json::from_slice(&encoded).expect("deserialize worker result");
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn older_worker_results_are_not_temporary() {
+        let decoded: UpdateWorkerResult =
+            serde_json::from_slice(br#"{"helper":null,"error":"kaputt"}"#)
+                .expect("deserialize old worker result");
+        assert!(!decoded.temporary);
+    }
+
+    #[test]
+    fn github_rate_limits_and_outages_are_temporary() {
+        use reqwest::StatusCode;
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let empty = HeaderMap::new();
+        let mut exhausted = HeaderMap::new();
+        exhausted.insert("x-ratelimit-remaining", HeaderValue::from_static("0"));
+        let mut secondary = HeaderMap::new();
+        secondary.insert("retry-after", HeaderValue::from_static("60"));
+
+        assert!(github_unavailable(StatusCode::FORBIDDEN, &exhausted));
+        assert!(github_unavailable(StatusCode::FORBIDDEN, &secondary));
+        assert!(github_unavailable(StatusCode::TOO_MANY_REQUESTS, &empty));
+        assert!(github_unavailable(StatusCode::BAD_GATEWAY, &empty));
+        assert!(!github_unavailable(StatusCode::FORBIDDEN, &empty));
+        assert!(!github_unavailable(StatusCode::OK, &empty));
+        assert!(!github_unavailable(StatusCode::UNAUTHORIZED, &empty));
+
+        let temporary = temporary_update_error("GitHub begrenzt".to_owned());
+        assert!(is_temporary_update_error(temporary.as_ref()));
+        let permanent: Box<dyn std::error::Error + Send + Sync> =
+            "Die heruntergeladene App hat eine ungültige Prüfsumme.".into();
+        assert!(!is_temporary_update_error(permanent.as_ref()));
     }
 }
